@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(lan_auto_accept_invites, true, "Network",
                     "Accept game invites from LAN players immediately (there is no Xbox "
                     "guide to accept them from)");
 
+REXCVAR_DEFINE_STRING(lan_join, "", "Network",
+                      "Join a LAN player's game automatically once both games are in the "
+                      "world: their IPv4 address, or 'auto' for the first one found. Empty = "
+                      "only join with the hotkey (F9)");
+
 namespace rex::kernel::xam::lobby {
 
 namespace {
@@ -279,6 +284,86 @@ void handle_invite(const uint8_t* data, size_t size, uint32_t from_ip) {
   }
 }
 
+// "Join session" from the Xbox guide: treat a LAN player's session as an
+// accepted invite (join via presence) and tell the title.
+bool join_remote(uint32_t only_ip) {
+  std::optional<Advert> target;
+  {
+    std::lock_guard lock(mutex);
+    for (const auto& [id, a] : remotes) {
+      if ((!only_ip || a.host_ip == only_ip) &&
+          a.used_public + a.used_private < a.max_public + a.max_private) {
+        target = a;
+        break;
+      }
+    }
+    if (!target) {
+      return false;
+    }
+    InviteInfo invite{};
+    invite.title_id = target->title_id;
+    invite.xuid_inviter = target->host_xuid;
+    invite.xuid_invitee = 0;
+    std::memcpy(invite.gamertag, target->gamertag, sizeof(invite.gamertag));
+    invite.host_info = target->info;
+    accepted_invite = invite;
+  }
+  REXKRNL_INFO("LAN lobby: joining '{}' at {} (session {:016X})", target->gamertag,
+               systemlink::ip_to_string(target->host_ip), session_id(target->info));
+  REX_KERNEL_STATE()->BroadcastNotification(0x02000002, 0);  // XN_LIVE_INVITE_ACCEPTED
+  return true;
+}
+
+void invite_all() {
+  const uint64_t inviter = systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+  for (const auto& player : RemotePlayers()) {
+    SendInvite(player.xuid, inviter);
+  }
+}
+
+// Guide replacements while the game window has focus: F9 joins the LAN
+// player's game, F10 invites LAN players into ours.
+void poll_hotkeys() {
+#if REX_PLATFORM_WIN32
+  static bool f9_down = false, f10_down = false;
+  HWND foreground = GetForegroundWindow();
+  DWORD pid = 0;
+  if (foreground) GetWindowThreadProcessId(foreground, &pid);
+  const bool focused = pid == GetCurrentProcessId();
+  const bool f9 = focused && (GetAsyncKeyState(VK_F9) & 0x8000);
+  const bool f10 = focused && (GetAsyncKeyState(VK_F10) & 0x8000);
+  if (f9 && !f9_down) {
+    REXKRNL_INFO("LAN lobby: F9 pressed (join)");
+    if (!join_remote(0)) REXKRNL_WARN("LAN lobby: no joinable LAN game found");
+  }
+  if (f10 && !f10_down) {
+    REXKRNL_INFO("LAN lobby: F10 pressed (invite)");
+    invite_all();
+  }
+  f9_down = f9;
+  f10_down = f10;
+#endif
+}
+
+void maybe_auto_join() {
+  static bool done = false;
+  const std::string& target = REXCVAR_GET(lan_join);
+  if (done || target.empty() || session::HostedSessions().empty()) {
+    return;  // only once our own game is in the world
+  }
+  uint32_t ip = 0;
+  if (target != "auto") {
+    in_addr addr{};
+    if (inet_pton(AF_INET, target.c_str(), &addr) != 1) {
+      REXKRNL_ERROR("LAN lobby: lan_join '{}' is not an IPv4 address", target);
+      done = true;
+      return;
+    }
+    ip = ntohl(addr.s_addr);
+  }
+  done = join_remote(ip);
+}
+
 void run() {
 #if REX_PLATFORM_WIN32
   WSADATA wsa;
@@ -314,6 +399,7 @@ void run() {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_beacon) {
       next_beacon = now + kBeaconInterval;
+      maybe_auto_join();
       const uint32_t title_id = REX_KERNEL_STATE()->title_id();
       for (const auto& hosted : session::HostedSessions()) {
         const auto beacon = encode(hosted, title_id);
@@ -334,10 +420,11 @@ void run() {
       }
     }
 
+    poll_hotkeys();
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(s, &fds);
-    timeval tv{0, 200 * 1000};
+    timeval tv{0, 50 * 1000};
     if (select(int(s) + 1, &fds, nullptr, nullptr, &tv) <= 0) {
       continue;
     }
