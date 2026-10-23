@@ -18,6 +18,10 @@
  *   u32 magic 'RXLH'  u8 version  u32 title_id  u32 game_ip
  *   u64 online_xuid  char gamertag[16]  u8 in_world
  *
+ * Data wire format (keyed values for co-op features, unicast to each peer):
+ *   u32 magic 'RXLD'  u8 version  u32 title_id  char key[16]  u32 revision
+ *   u32 total_size  u16 part  u16 part_count  u16 size  u8 data[size]
+ *
  * Announcements go to every adapter's directed broadcast (from a socket bound
  * to that adapter, so virtual LANs such as ZeroTier get their own copy), to
  * 255.255.255.255, to lan_peers, and by unicast to every peer heard from, so
@@ -412,6 +416,149 @@ void handle_hello(const uint8_t* data, size_t size, uint32_t from_ip) {
   note_peer(from_ip, game_ip, &hello);
 }
 
+// --- keyed data channel ---------------------------------------------------
+
+constexpr uint32_t kDataMagic = 0x444C5852;  // 'RXLD'
+constexpr size_t kDataChunk = 1200;          // payload bytes per datagram
+constexpr auto kDataResend = std::chrono::seconds(3);
+
+struct LocalData {
+  uint32_t revision = 0;
+  std::string value;
+};
+std::map<std::string, LocalData> local_data;  // guarded by mutex
+uint32_t next_revision = 0;                     // guarded by mutex
+
+struct Assembly {
+  uint32_t revision = 0;
+  uint32_t total = 0;
+  std::vector<std::string> parts;
+  size_t received = 0;
+};
+struct ReceivedData {
+  uint32_t revision = 0;
+  std::string value;
+  std::string gamertag;  // copied from the peer, which may expire before this
+  uint64_t xuid = 0;
+  std::chrono::steady_clock::time_point when;
+};
+// Keyed by (sender ip, key); guarded by mutex.
+std::map<std::pair<uint32_t, std::string>, Assembly> data_assembly;
+std::map<std::pair<uint32_t, std::string>, ReceivedData> received_data;
+
+std::vector<std::vector<uint8_t>> encode_data(const std::string& key, const LocalData& d) {
+  std::vector<std::vector<uint8_t>> out;
+  const size_t total = d.value.size();
+  const uint16_t count = uint16_t(std::max<size_t>(1, (total + kDataChunk - 1) / kDataChunk));
+  for (uint16_t i = 0; i < count; ++i) {
+    const size_t offset = size_t(i) * kDataChunk;
+    const size_t size = std::min(kDataChunk, total - std::min(total, offset));
+    Writer w;
+    w.u32(kDataMagic);
+    w.u8(kVersion);
+    w.u32(REX_KERNEL_STATE()->title_id());
+    char k[16] = {};
+    std::strncpy(k, key.c_str(), sizeof(k) - 1);
+    w.bytes(k, sizeof(k));
+    w.u32(d.revision);
+    w.u32(uint32_t(total));
+    w.u8(uint8_t(i));
+    w.u8(uint8_t(i >> 8));
+    w.u8(uint8_t(count));
+    w.u8(uint8_t(count >> 8));
+    w.u8(uint8_t(size));
+    w.u8(uint8_t(size >> 8));
+    w.bytes(d.value.data() + offset, size);
+    out.push_back(std::move(w.buf));
+  }
+  return out;
+}
+
+void handle_data(const uint8_t* data, size_t size, uint32_t from_ip) {
+  Reader r{data, size};
+  if (r.u32() != kDataMagic || r.u8() != kVersion) return;
+  const uint32_t title_id = r.u32();
+  char k[16] = {};
+  r.bytes(k, sizeof(k));
+  k[15] = 0;
+  const uint32_t revision = r.u32();
+  const uint32_t total = r.u32();
+  const uint16_t part = uint16_t(r.u8() | (r.u8() << 8));
+  const uint16_t count = uint16_t(r.u8() | (r.u8() << 8));
+  const uint16_t chunk = uint16_t(r.u8() | (r.u8() << 8));
+  if (!r.ok || title_id != REX_KERNEL_STATE()->title_id() || total > kMaxDataSize ||
+      count == 0 || part >= count || chunk > r.left ||
+      size_t(count) != std::max<size_t>(1, (total + kDataChunk - 1) / kDataChunk)) {
+    return;
+  }
+  note_peer(from_ip, 0, nullptr);
+  const auto id = std::make_pair(from_ip, std::string(k));
+  bool completed = false;
+  {
+    std::lock_guard lock(mutex);
+    auto have = received_data.find(id);
+    if (have != received_data.end() && have->second.revision == revision) {
+      have->second.when = std::chrono::steady_clock::now();
+      return;  // a resend of what we already have
+    }
+    Assembly& a = data_assembly[id];
+    if (a.revision != revision || a.parts.size() != count || a.total != total) {
+      a = Assembly{};
+      a.revision = revision;
+      a.total = total;
+      a.parts.assign(count, std::string());
+    }
+    if (a.parts[part].empty() && (chunk > 0 || total == 0)) {
+      a.parts[part].assign(reinterpret_cast<const char*>(r.p), chunk);
+      ++a.received;
+    }
+    if (a.received >= count) {
+      ReceivedData d;
+      d.revision = revision;
+      for (auto& p : a.parts) d.value += p;
+      d.when = std::chrono::steady_clock::now();
+      if (auto peer = peers.find(from_ip); peer != peers.end()) {
+        d.gamertag = peer->second.gamertag;
+        d.xuid = peer->second.xuid;
+      }
+      if (d.value.size() == total) {
+        received_data[id] = std::move(d);
+        completed = true;
+      }
+      data_assembly.erase(id);
+    }
+  }
+  if (completed) {
+    REXKRNL_INFO("LAN lobby: received '{}' data ({} bytes, revision {:08X}) from {}", k, total,
+                 revision, systemlink::ip_to_string(from_ip));
+  }
+}
+
+// Sends every published value to `targets`.
+void send_data(sock_t s, const std::vector<uint32_t>& targets, uint16_t port,
+               const std::string* only_key = nullptr) {
+  std::vector<std::vector<uint8_t>> packets;
+  {
+    std::lock_guard lock(mutex);
+    for (const auto& [key, d] : local_data) {
+      if (only_key && key != *only_key) continue;
+      for (auto& p : encode_data(key, d)) packets.push_back(std::move(p));
+    }
+  }
+  for (uint32_t ip : targets) {
+    for (const auto& p : packets) send_to(s, p, ip, port);
+  }
+}
+
+std::vector<uint32_t> peer_targets() {
+  std::vector<uint32_t> out = peer_ips();
+  std::lock_guard lock(mutex);
+  for (const auto& [ip, p] : peers) {
+    if (std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(ip);
+  }
+  return out;
+}
+
 constexpr uint32_t kInviteMagic = 0x494C5852;  // 'RXLI'
 
 std::atomic<uint64_t> lobby_socket{~0ull};
@@ -601,6 +748,7 @@ void run() {
 
   auto next_beacon = std::chrono::steady_clock::now();
   auto next_refresh = next_beacon + std::chrono::seconds(10);
+  auto next_data = next_beacon;
   std::vector<uint8_t> packet(1500);
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
@@ -622,6 +770,10 @@ void run() {
         }
       }
       announce(s, encode_hello(title_id), port, unicast);
+      if (now >= next_data) {
+        next_data = now + kDataResend;
+        send_data(s, unicast, port);
+      }
       for (const auto& hosted : session::HostedSessions()) {
         announce(s, encode(hosted, title_id), port, unicast);
       }
@@ -681,6 +833,10 @@ void run() {
     }
     if (magic == kHelloMagic) {
       handle_hello(packet.data(), size_t(n), from_ip);
+      continue;
+    }
+    if (magic == kDataMagic) {
+      handle_data(packet.data(), size_t(n), from_ip);
       continue;
     }
     Advert advert;
@@ -1014,6 +1170,59 @@ bool InviteLanPeer(uint32_t ip) {
   }
   set_event("Invited " + (name.empty() ? systemlink::ip_to_string(ip) : name));
   return true;
+}
+
+bool PublishData(const std::string& key, const std::string& value) {
+  if (key.empty() || key.size() > 15 || value.size() > kMaxDataSize) {
+    REXKRNL_WARN("LAN lobby: not publishing '{}' ({} bytes): key or value too large", key,
+                 value.size());
+    return false;
+  }
+  {
+    std::lock_guard lock(mutex);
+    if (!next_revision) {
+      // Seed from the clock so a restarted game never reuses a revision the
+      // other side already has.
+      next_revision = uint32_t(std::chrono::system_clock::now().time_since_epoch().count());
+    }
+    LocalData& d = local_data[key];
+    if (d.revision && d.value == value) {
+      return true;
+    }
+    d.revision = ++next_revision ? next_revision : ++next_revision;
+    d.value = value;
+  }
+  REXKRNL_INFO("LAN lobby: publishing '{}' ({} bytes)", key, value.size());
+  Start();
+  const uint64_t sock = lobby_socket.load();
+  if (sock != ~0ull) {
+    send_data(sock_t(sock), peer_targets(), uint16_t(REXCVAR_GET(lan_lobby_port)), &key);
+  }
+  return true;
+}
+
+std::vector<PeerData> GetPeerData(const std::string& key) {
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<PeerData> out;
+  std::lock_guard lock(mutex);
+  for (const auto& [id, d] : received_data) {
+    if (id.second != key) continue;
+    PeerData pd;
+    pd.ip = id.first;
+    pd.address = systemlink::ip_to_string(id.first);
+    pd.revision = d.revision;
+    pd.value = d.value;
+    pd.seconds_since_received =
+        int(std::chrono::duration_cast<std::chrono::seconds>(now - d.when).count());
+    pd.gamertag = d.gamertag;
+    pd.xuid = d.xuid;
+    if (auto it = peers.find(id.first); it != peers.end() && it->second.xuid) {
+      pd.gamertag = it->second.gamertag;
+      pd.xuid = it->second.xuid;
+    }
+    out.push_back(std::move(pd));
+  }
+  return out;
 }
 
 }  // namespace rex::kernel::xam::lobby

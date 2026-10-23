@@ -48,4 +48,24 @@ bool JoinLanPeer(uint32_t ip);
 // Invite the player at `ip` into the session we host (same as F10).
 bool InviteLanPeer(uint32_t ip);
 
+// Keyed data shared with every LAN player, for co-op features layered on top
+// of the game (e.g. "hero" = the joiner's hero profile, "story" = the host's
+// story progress). The latest value per key is sent to each player as soon as
+// it is published and again every few seconds, split into datagrams when
+// large (up to kMaxDataSize bytes). Received values are kept after the sender
+// goes quiet, so a value sent at the end of a session can still be read.
+constexpr size_t kMaxDataSize = 60 * 1024;
+struct PeerData {
+  uint32_t ip = 0;  // host byte order, the address their packets come from
+  std::string address;
+  std::string gamertag;
+  uint64_t xuid = 0;        // their online XUID (0 if not heard yet)
+  uint32_t revision = 0;    // changes whenever the sender publishes again
+  int seconds_since_received = 0;
+  std::string value;
+};
+// Keys are up to 15 characters. Returns false if the key or value is too big.
+bool PublishData(const std::string& key, const std::string& value);
+std::vector<PeerData> GetPeerData(const std::string& key);
+
 }  // namespace rex::kernel::xam::lobby
