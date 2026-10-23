@@ -149,6 +149,33 @@ X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
+// XStorageEnumerate is an async LIVE task: the message is an
+// XLIVEBASE_ASYNC_MESSAGE whose first word points at the XLIVE_ASYNC_TASK
+// (results_ptr at +0x2C, results_size at +0x30). With no title storage
+// online, report an empty listing so the title moves on.
+X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr, uint32_t buffer_length) {
+  if (!buffer_ptr || buffer_length != 0x28) {
+    return X_E_INVALIDARG;
+  }
+  auto* message = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
+  const uint32_t task_ptr = memory::load_and_swap<uint32_t>(message);
+  if (!task_ptr) {
+    return X_E_INVALIDARG;
+  }
+  auto* task = memory_->TranslateVirtual<uint8_t*>(task_ptr);
+  const uint32_t results_ptr = memory::load_and_swap<uint32_t>(task + 0x2C);
+  const uint32_t results_size = memory::load_and_swap<uint32_t>(task + 0x30);
+  if (!results_ptr || results_size < 0xC) {
+    return X_E_INVALIDARG;
+  }
+  // X_STORAGE_ENUMERATE_RESULTS { total_num_items, num_items_returned, items_ptr }
+  auto* results = memory_->TranslateVirtual<uint8_t*>(results_ptr);
+  std::memset(results, 0, results_size);
+  memory::store_and_swap<uint32_t>(results + 0x8, results_ptr + 0xC);
+  REXKRNL_INFO("XStorageEnumerate -> 0 items (no LIVE title storage)");
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
@@ -204,6 +231,9 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // XStorageDownloadToMemory: there is no LIVE title storage to fetch from.
       REXKRNL_DEBUG("XStorageDownloadToMemory({:08X}) -> file not found", buffer_ptr);
       return 0x8015C004;  // X_ONLINE_E_STORAGE_FILE_NOT_FOUND
+    }
+    case 0x0005000A: {
+      return XStorageEnumerate(buffer_ptr, buffer_length);
     }
     case 0x00058037: {
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
