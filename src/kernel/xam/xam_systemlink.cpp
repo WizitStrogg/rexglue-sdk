@@ -9,7 +9,9 @@
 #include <rex/kernel/xam/systemlink.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string_view>
@@ -18,6 +20,8 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/user_profile.h>
 
 #if REX_PLATFORM_WIN32
 #include <winsock2.h>
@@ -34,16 +38,20 @@
 
 REXCVAR_DEFINE_STRING(network_mode, "offline", "Network",
                       "Guest networking: 'offline' (no network, the default) or 'systemlink' "
-                      "(LAN play between ReXGlue instances)");
+                      "(LAN play between ReXGlue instances)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(network_interface, "",
                       "Network",
                       "IPv4 address of the host adapter used for System Link (e.g. a ZeroTier "
-                      "or Hamachi address). Empty = pick the first private LAN adapter");
+                      "or Hamachi address). Empty = pick the first private LAN adapter; the LAN "
+                      "lobby still announces on every adapter")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(profile_xuid, "", "Network",
                       "Player identity. Empty or 'auto' = keep the built-in offline XUID (which "
                       "owns the saves) and, with networking on, derive a per-PC online XUID "
                       "from this PC's name. A 16-digit hex value replaces both, so existing "
-                      "saves will not load");
+                      "saves will not load")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(profile_gamertag, "", "Network",
                       "Gamertag shown to other players. Empty = built-in default");
 
@@ -222,6 +230,17 @@ std::mt19937_64& rng() {
 
 std::atomic<uint64_t> registered_session{0};
 
+bool is_usable(const Adapter& a) {
+  return a.ip != kLoopback && (a.ip >> 16) != (169 << 8 | 254) && (a.ip >> 24) != 0;
+}
+
+std::mutex adapters_mutex;
+std::vector<LocalAdapter> cached_adapters;
+std::chrono::steady_clock::time_point adapters_time;
+
+std::mutex alias_mutex;
+std::map<uint32_t, uint32_t> peer_aliases;  // claimed ip -> observed ip
+
 uint64_t fnv1a64(std::string_view text) {
   uint64_t h = 0xCBF29CE484222325ull;
   for (unsigned char c : text) {
@@ -264,6 +283,49 @@ std::string ip_to_string(uint32_t ip) {
          std::to_string((ip >> 8) & 0xFF) + "." + std::to_string(ip & 0xFF);
 }
 
+std::vector<LocalAdapter> adapters() {
+  std::lock_guard lock(adapters_mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (cached_adapters.empty() || now - adapters_time > std::chrono::seconds(5)) {
+    std::vector<LocalAdapter> fresh;
+    for (const auto& a : enumerate_adapters()) {
+      if (!is_usable(a)) {
+        continue;
+      }
+      LocalAdapter out;
+      out.ip = a.ip;
+      out.mask = a.mask ? a.mask : 0xFFFFFF00u;
+      out.broadcast = (a.ip & out.mask) | ~out.mask;
+      out.name = a.name;
+      fresh.push_back(out);
+    }
+    cached_adapters = std::move(fresh);
+    adapters_time = now;
+  }
+  return cached_adapters;
+}
+
+uint32_t local_ip_for_peer(uint32_t peer_ip) {
+  for (const auto& a : adapters()) {
+    if ((a.ip & a.mask) == (peer_ip & a.mask)) {
+      return a.ip;
+    }
+  }
+  return local_ip();
+}
+
+void note_peer_address(uint32_t claimed_ip, uint32_t observed_ip) {
+  if (!claimed_ip || claimed_ip == observed_ip) {
+    return;
+  }
+  std::lock_guard lock(alias_mutex);
+  auto [it, inserted] = peer_aliases.insert_or_assign(claimed_ip, observed_ip);
+  if (inserted) {
+    REXKRNL_INFO("SystemLink: peer at {} announces itself as {}; routing to {}",
+                 ip_to_string(observed_ip), ip_to_string(claimed_ip), ip_to_string(observed_ip));
+  }
+}
+
 void xnaddr_from_ip(uint32_t ip, XNADDR* out) {
   std::memset(out, 0, sizeof(XNADDR));
   out->ina = htonl(ip);
@@ -280,14 +342,18 @@ void get_local_xnaddr(XNADDR* out) {
 }
 
 uint32_t ip_from_xnaddr(const XNADDR& addr) {
+  uint32_t ip = 0;
   if (addr.ina) {
-    return ntohl(addr.ina);
+    ip = ntohl(addr.ina);
+  } else if (addr.abEnet[0] == 0x02 && addr.abEnet[1] == 0x58) {
+    ip = uint32_t(addr.abEnet[2]) << 24 | uint32_t(addr.abEnet[3]) << 16 |
+         uint32_t(addr.abEnet[4]) << 8 | addr.abEnet[5];
+  } else {
+    ip = ntohl(addr.inaOnline);
   }
-  if (addr.abEnet[0] == 0x02 && addr.abEnet[1] == 0x58) {
-    return uint32_t(addr.abEnet[2]) << 24 | uint32_t(addr.abEnet[3]) << 16 |
-           uint32_t(addr.abEnet[4]) << 8 | addr.abEnet[5];
-  }
-  return ntohl(addr.inaOnline);
+  std::lock_guard lock(alias_mutex);
+  auto it = peer_aliases.find(ip);
+  return it != peer_aliases.end() ? it->second : ip;
 }
 
 bool is_local_xnaddr(const XNADDR& addr) {
@@ -371,6 +437,11 @@ uint64_t online_xuid(uint64_t legacy_xuid) {
 
 const std::string& gamertag_override() {
   return REXCVAR_GET(profile_gamertag);
+}
+
+std::string display_name() {
+  const std::string& override_tag = gamertag_override();
+  return override_tag.empty() ? REX_KERNEL_STATE()->user_profile()->name() : override_tag;
 }
 
 }  // namespace rex::kernel::xam::systemlink

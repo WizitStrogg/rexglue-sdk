@@ -37,6 +37,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "xam_lan_lobby.h"
+
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
@@ -148,6 +150,9 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
   }
   REXKRNL_INFO("XNetStartup (System Link {})",
                systemlink::enabled() ? guest_ip_string(systemlink::local_ip()) : "off");
+  // Announce ourselves from the title screen on, so players see each other
+  // (and the co-op menu lists them) before anyone is in the game world.
+  lobby::Start();
   return 0;
 }
 

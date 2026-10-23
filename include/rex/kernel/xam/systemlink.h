@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <rex/types.h>
 
@@ -76,6 +77,26 @@ uint32_t local_ip();
 uint32_t broadcast_ip();
 std::string ip_to_string(uint32_t host_order_ip);
 
+// Every usable IPv4 adapter that is up right now (no loopback, no link-local),
+// host byte order. Re-enumerated at most every few seconds, so adapters that
+// come up after launch (ZeroTier, Hamachi, VPNs) are picked up.
+struct LocalAdapter {
+  uint32_t ip = 0;
+  uint32_t mask = 0;
+  uint32_t broadcast = 0;  // directed broadcast (ip | ~mask)
+  std::string name;
+};
+std::vector<LocalAdapter> adapters();
+
+// The local adapter address on the same subnet as `peer_ip`, else local_ip().
+uint32_t local_ip_for_peer(uint32_t peer_ip);
+
+// Peers announce the address their game uses (their local_ip()), which may be
+// an adapter we cannot reach (e.g. their home LAN while we play over ZeroTier).
+// The LAN lobby records claimed -> observed source address, and
+// ip_from_xnaddr() translates through it.
+void note_peer_address(uint32_t claimed_ip, uint32_t observed_ip);
+
 // Fills the guest-visible XNADDR of this machine.
 void get_local_xnaddr(XNADDR* out);
 // Rebuilds a peer's XNADDR from its IPv4 address (host byte order).
@@ -103,6 +124,8 @@ uint64_t network_xuid(uint64_t legacy_xuid);
 uint64_t online_xuid(uint64_t legacy_xuid);
 // Gamertag override (cvar profile_gamertag), empty if unset.
 const std::string& gamertag_override();
+// Name other players see: the override, else the profile name.
+std::string display_name();
 
 }  // namespace systemlink
 }  // namespace rex::kernel::xam

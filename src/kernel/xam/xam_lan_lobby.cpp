@@ -12,9 +12,21 @@
  *   u64 host_xuid  char gamertag[16]
  *   u8 context_count  { u32 id, u32 value } * n
  *   u8 property_count { u32 id, u8 size, u8 data[8] } * n
+ *
+ * Hello wire format (sent every second, hosting or not, so players find each
+ * other before either is in the game world):
+ *   u32 magic 'RXLH'  u8 version  u32 title_id  u32 game_ip
+ *   u64 online_xuid  char gamertag[16]  u8 in_world
+ *
+ * Announcements go to every adapter's directed broadcast (from a socket bound
+ * to that adapter, so virtual LANs such as ZeroTier get their own copy), to
+ * 255.255.255.255, to lan_peers, and by unicast to every peer heard from, so
+ * one direction of broadcast getting through is enough for both sides.
  */
 
 #include "xam_lan_lobby.h"
+
+#include <rex/kernel/xam/lan_lobby.h>
 
 #include <algorithm>
 #include <cctype>
@@ -50,7 +62,8 @@
 
 REXCVAR_DEFINE_UINT32(lan_lobby_port, 3075, "Network",
                       "UDP port used to announce and discover hosted sessions between "
-                      "ReXGlue instances (must be open in the firewall)");
+                      "ReXGlue instances (must be open in the firewall)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(lan_peers, "", "Network",
                       "Comma-separated IPv4 addresses that also receive session announcements, "
                       "for networks where broadcast does not reach the other PC");
@@ -98,6 +111,24 @@ std::map<uint32_t, uint32_t> local_contexts;
 std::map<uint32_t, Property> local_properties;
 std::map<uint64_t, Advert> remotes;  // keyed by session id
 std::atomic<bool> started{false};
+
+constexpr uint32_t kHelloMagic = 0x484C5852;  // 'RXLH'
+
+struct Peer {
+  uint32_t ip = 0;          // observed source address
+  uint32_t game_ip = 0;     // address their game claims (their XNADDR)
+  uint64_t xuid = 0;
+  char gamertag[16] = {};
+  bool in_world = false;
+  std::chrono::steady_clock::time_point last_seen;
+};
+std::map<uint32_t, Peer> peers;  // keyed by observed ip, guarded by mutex
+std::string last_event;          // guarded by mutex
+
+void set_event(std::string text) {
+  std::lock_guard lock(mutex);
+  last_event = std::move(text);
+}
 
 uint64_t session_id(const XSESSION_INFO& info) {
   return memory::load_and_swap<uint64_t>(info.sessionID.ab);
@@ -162,10 +193,7 @@ std::vector<uint8_t> encode(const session::HostedSession& s, uint32_t title_id) 
   w.u32(s.used_private);
   w.u64(s.host_xuid);
   char tag[16] = {};
-  const std::string& override_tag = systemlink::gamertag_override();
-  const std::string name =
-      override_tag.empty() ? REX_KERNEL_STATE()->user_profile()->name() : override_tag;
-  std::strncpy(tag, name.c_str(), sizeof(tag) - 1);
+  std::strncpy(tag, systemlink::display_name().c_str(), sizeof(tag) - 1);
   w.bytes(tag, sizeof(tag));
   std::lock_guard lock(mutex);
   w.u8(uint8_t(std::min(local_contexts.size(), kMaxValues)));
@@ -254,6 +282,136 @@ void send_to(sock_t s, const std::vector<uint8_t>& packet, uint32_t ip, uint16_t
          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
+// One sending socket per local adapter, bound to its address, so broadcasts
+// leave through that adapter (Windows sends 255.255.255.255 and other
+// adapters' broadcasts out of the default route only). Owned by the lobby
+// thread.
+struct AdapterSocket {
+  systemlink::LocalAdapter adapter;
+  sock_t s = kBadSocket;
+};
+std::vector<AdapterSocket> adapter_sockets;
+std::atomic<size_t> adapter_socket_count{0};
+
+void refresh_adapter_sockets() {
+  const auto current = systemlink::adapters();
+  for (auto it = adapter_sockets.begin(); it != adapter_sockets.end();) {
+    const bool still_up = std::any_of(current.begin(), current.end(), [&](const auto& a) {
+      return a.ip == it->adapter.ip && a.broadcast == it->adapter.broadcast;
+    });
+    if (still_up) {
+      ++it;
+      continue;
+    }
+    REXKRNL_INFO("LAN lobby: adapter '{}' {} went away", it->adapter.name,
+                 systemlink::ip_to_string(it->adapter.ip));
+    close_socket(it->s);
+    it = adapter_sockets.erase(it);
+  }
+  for (const auto& a : current) {
+    if (std::any_of(adapter_sockets.begin(), adapter_sockets.end(),
+                    [&](const AdapterSocket& as) { return as.adapter.ip == a.ip; })) {
+      continue;
+    }
+    sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == kBadSocket) {
+      continue;
+    }
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(a.ip);
+    if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+      close_socket(s);
+      continue;
+    }
+    REXKRNL_INFO("LAN lobby: announcing on '{}' {} (broadcast {})", a.name,
+                 systemlink::ip_to_string(a.ip), systemlink::ip_to_string(a.broadcast));
+    adapter_sockets.push_back({a, s});
+  }
+  adapter_socket_count.store(adapter_sockets.size());
+}
+
+bool is_own_address(uint32_t ip) {
+  if (ip == systemlink::local_ip()) {
+    return true;
+  }
+  return std::any_of(adapter_sockets.begin(), adapter_sockets.end(),
+                     [&](const AdapterSocket& as) { return as.adapter.ip == ip; });
+}
+
+// Sends `packet` everywhere a player might be: each adapter's directed and
+// limited broadcast, configured lan_peers and every peer heard from.
+void announce(sock_t main, const std::vector<uint8_t>& packet, uint16_t port,
+              const std::vector<uint32_t>& unicast) {
+  for (const auto& as : adapter_sockets) {
+    send_to(as.s, packet, as.adapter.broadcast, port);
+    send_to(as.s, packet, 0xFFFFFFFFu, port);
+  }
+  for (uint32_t ip : unicast) {
+    send_to(main, packet, ip, port);
+  }
+}
+
+uint64_t own_online_xuid() {
+  return systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+}
+
+std::vector<uint8_t> encode_hello(uint32_t title_id) {
+  Writer w;
+  w.u32(kHelloMagic);
+  w.u8(kVersion);
+  w.u32(title_id);
+  w.u32(systemlink::local_ip());
+  w.u64(own_online_xuid());
+  char tag[16] = {};
+  std::strncpy(tag, systemlink::display_name().c_str(), sizeof(tag) - 1);
+  w.bytes(tag, sizeof(tag));
+  w.u8(session::HostedSessions().empty() ? 0 : 1);
+  return w.buf;
+}
+
+// Records a packet's sender as a peer. game_ip is the address their game
+// claims to be at (0 if the packet does not say).
+void note_peer(uint32_t from_ip, uint32_t game_ip, const Peer* hello) {
+  if (game_ip) {
+    systemlink::note_peer_address(game_ip, from_ip);
+  }
+  bool added = false;
+  {
+    std::lock_guard lock(mutex);
+    auto [it, inserted] = peers.try_emplace(from_ip);
+    Peer& p = it->second;
+    p.ip = from_ip;
+    if (game_ip) p.game_ip = game_ip;
+    if (hello) {
+      p.xuid = hello->xuid;
+      std::memcpy(p.gamertag, hello->gamertag, sizeof(p.gamertag));
+      p.in_world = hello->in_world;
+    }
+    p.last_seen = std::chrono::steady_clock::now();
+    added = inserted;
+  }
+  if (added) {
+    REXKRNL_INFO("LAN lobby: heard from player at {}", systemlink::ip_to_string(from_ip));
+  }
+}
+
+void handle_hello(const uint8_t* data, size_t size, uint32_t from_ip) {
+  Reader r{data, size};
+  if (r.u32() != kHelloMagic || r.u8() != kVersion) return;
+  const uint32_t title_id = r.u32();
+  const uint32_t game_ip = r.u32();
+  Peer hello;
+  hello.xuid = r.u64();
+  r.bytes(hello.gamertag, sizeof(hello.gamertag));
+  hello.gamertag[15] = 0;
+  hello.in_world = r.u8() != 0;
+  if (!r.ok || title_id != REX_KERNEL_STATE()->title_id()) return;
+  note_peer(from_ip, game_ip, &hello);
+}
+
 constexpr uint32_t kInviteMagic = 0x494C5852;  // 'RXLI'
 
 std::atomic<uint64_t> lobby_socket{~0ull};
@@ -270,6 +428,7 @@ void handle_invite(const uint8_t* data, size_t size, uint32_t from_ip) {
   invite.gamertag[15] = 0;
   r.bytes(&invite.host_info, sizeof(invite.host_info));
   if (!r.ok || invite.title_id != REX_KERNEL_STATE()->title_id()) return;
+  note_peer(from_ip, systemlink::ip_from_xnaddr(invite.host_info.hostAddress), nullptr);
   systemlink::xnaddr_from_ip(from_ip, &invite.host_info.hostAddress);
   invite.from_game_invite = true;
   REXKRNL_INFO("LAN lobby: game invite from '{}' ({}) to session {:016X}", invite.gamertag,
@@ -282,6 +441,9 @@ void handle_invite(const uint8_t* data, size_t size, uint32_t from_ip) {
     // XN_LIVE_INVITE_ACCEPTED for user 0.
     REX_KERNEL_STATE()->BroadcastNotification(0x02000002, 0);
     REXKRNL_INFO("LAN lobby: invite accepted automatically");
+    set_event(std::string("Accepted invite from ") + invite.gamertag);
+  } else {
+    set_event(std::string("Invite from ") + invite.gamertag);
   }
 }
 
@@ -299,6 +461,7 @@ bool join_remote(uint32_t only_ip) {
       }
     }
     if (!target) {
+      last_event = "No joinable game found";
       return false;
     }
     InviteInfo invite{};
@@ -309,6 +472,7 @@ bool join_remote(uint32_t only_ip) {
     invite.host_info = target->info;
     invite.from_game_invite = false;
     accepted_invite = invite;
+    last_event = std::string("Joining ") + target->gamertag;
   }
   REXKRNL_INFO("LAN lobby: joining '{}' at {} (session {:016X})", target->gamertag,
                systemlink::ip_to_string(target->host_ip), session_id(target->info));
@@ -316,10 +480,48 @@ bool join_remote(uint32_t only_ip) {
   return true;
 }
 
+// Sends our hosted session to the player at `target_ip`.
+bool send_invite_to(uint32_t target_ip, uint64_t invitee_xuid, uint64_t inviter_xuid) {
+  const uint64_t sock = lobby_socket.load();
+  const auto hosted = session::HostedSessions();
+  if (sock == ~0ull || hosted.empty()) {
+    REXKRNL_WARN("LAN lobby: cannot send invite (lobby {}, {} hosted session(s))",
+                 sock == ~0ull ? "not running" : "running", hosted.size());
+    set_event(hosted.empty() ? "Load into the world before inviting" : "Lobby is not running");
+    return false;
+  }
+  Writer w;
+  w.u32(kInviteMagic);
+  w.u8(kVersion);
+  w.u32(REX_KERNEL_STATE()->title_id());
+  w.u64(inviter_xuid);
+  w.u64(invitee_xuid);
+  char tag[16] = {};
+  std::strncpy(tag, systemlink::display_name().c_str(), sizeof(tag) - 1);
+  w.bytes(tag, sizeof(tag));
+  w.bytes(&hosted.front().info, sizeof(XSESSION_INFO));
+  for (int i = 0; i < 3; ++i) {  // UDP: send a few copies
+    send_to(sock_t(sock), w.buf, target_ip, uint16_t(REXCVAR_GET(lan_lobby_port)));
+  }
+  REXKRNL_INFO("LAN lobby: sent game invite for session {:016X} to {}",
+               session_id(hosted.front().info), systemlink::ip_to_string(target_ip));
+  return true;
+}
+
 void invite_all() {
-  const uint64_t inviter = systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
-  for (const auto& player : RemotePlayers()) {
-    SendInvite(player.xuid, inviter);
+  std::vector<std::pair<uint32_t, uint64_t>> targets;
+  {
+    std::lock_guard lock(mutex);
+    for (const auto& [ip, p] : peers) targets.emplace_back(ip, p.xuid);
+  }
+  size_t sent = 0;
+  for (const auto& [ip, xuid] : targets) {
+    sent += send_invite_to(ip, xuid, own_online_xuid()) ? 1 : 0;
+  }
+  if (sent) {
+    set_event("Invited " + std::to_string(sent) + " player(s)");
+  } else if (targets.empty()) {
+    set_event("No players found to invite");
   }
 }
 
@@ -375,6 +577,7 @@ void run() {
   sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (s == kBadSocket) {
     REXKRNL_ERROR("LAN lobby: could not create socket");
+    set_event("Could not create the lobby socket");
     return;
   }
   int one = 1;
@@ -386,29 +589,41 @@ void run() {
   bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   if (bind(s, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
     REXKRNL_ERROR("LAN lobby: could not bind UDP port {} (is another copy running?)", port);
+    set_event("UDP port " + std::to_string(port) + " is in use (another copy running?)");
     close_socket(s);
     return;
   }
   lobby_socket.store(uint64_t(s));
-  const uint32_t self = systemlink::local_ip();
-  const auto peers = peer_ips();
-  REXKRNL_INFO("LAN lobby: listening on UDP {} (broadcast {}, {} extra peer(s))", port,
-               systemlink::ip_to_string(systemlink::broadcast_ip()), peers.size());
+  const auto configured_peers = peer_ips();
+  refresh_adapter_sockets();
+  REXKRNL_INFO("LAN lobby: listening on UDP {} ({} adapter(s), {} configured peer(s))", port,
+               adapter_sockets.size(), configured_peers.size());
 
   auto next_beacon = std::chrono::steady_clock::now();
+  auto next_refresh = next_beacon + std::chrono::seconds(10);
   std::vector<uint8_t> packet(1500);
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
+    if (now >= next_refresh) {
+      next_refresh = now + std::chrono::seconds(10);
+      refresh_adapter_sockets();
+    }
     if (now >= next_beacon) {
       next_beacon = now + kBeaconInterval;
       maybe_auto_join();
       const uint32_t title_id = REX_KERNEL_STATE()->title_id();
-      for (const auto& hosted : session::HostedSessions()) {
-        const auto beacon = encode(hosted, title_id);
-        send_to(s, beacon, systemlink::broadcast_ip(), port);
-        for (uint32_t peer : peers) {
-          send_to(s, beacon, peer, port);
+      std::vector<uint32_t> unicast = configured_peers;
+      {
+        std::lock_guard lock(mutex);
+        for (const auto& [ip, p] : peers) {
+          if (std::find(unicast.begin(), unicast.end(), ip) == unicast.end()) {
+            unicast.push_back(ip);
+          }
         }
+      }
+      announce(s, encode_hello(title_id), port, unicast);
+      for (const auto& hosted : session::HostedSessions()) {
+        announce(s, encode(hosted, title_id), port, unicast);
       }
       bool removed = false;
       {
@@ -419,6 +634,15 @@ void run() {
                          systemlink::ip_to_string(it->second.host_ip));
             it = remotes.erase(it);
             removed = true;
+          } else {
+            ++it;
+          }
+        }
+        for (auto it = peers.begin(); it != peers.end();) {
+          if (now - it->second.last_seen > kExpiry) {
+            REXKRNL_INFO("LAN lobby: player at {} went quiet",
+                         systemlink::ip_to_string(it->first));
+            it = peers.erase(it);
           } else {
             ++it;
           }
@@ -447,11 +671,16 @@ void run() {
       continue;
     }
     const uint32_t from_ip = ntohl(from.sin_addr.s_addr);
-    if (from_ip == self) {
+    if (is_own_address(from_ip)) {
       continue;
     }
-    if (n >= 4 && Reader{packet.data(), size_t(n)}.u32() == kInviteMagic) {
+    const uint32_t magic = n >= 4 ? Reader{packet.data(), size_t(n)}.u32() : 0;
+    if (magic == kInviteMagic) {
       handle_invite(packet.data(), size_t(n), from_ip);
+      continue;
+    }
+    if (magic == kHelloMagic) {
+      handle_hello(packet.data(), size_t(n), from_ip);
       continue;
     }
     Advert advert;
@@ -459,7 +688,9 @@ void run() {
         advert.title_id != REX_KERNEL_STATE()->title_id()) {
       continue;
     }
-    // Trust the address the packet came from over the one it claims.
+    // Trust the address the packet came from over the one it claims, and
+    // route the claimed one there too (it may be an adapter we cannot reach).
+    note_peer(from_ip, advert.host_ip, nullptr);
     advert.host_ip = from_ip;
     systemlink::xnaddr_from_ip(from_ip, &advert.info.hostAddress);
     advert.last_seen = std::chrono::steady_clock::now();
@@ -689,49 +920,99 @@ std::vector<RemotePlayer> RemotePlayers() {
 }
 
 bool SendInvite(uint64_t invitee_xuid, uint64_t inviter_xuid) {
-  const uint64_t sock = lobby_socket.load();
-  const auto hosted = session::HostedSessions();
-  if (sock == ~0ull || hosted.empty()) {
-    REXKRNL_WARN("LAN lobby: cannot send invite (lobby {}, {} hosted session(s))",
-                 sock == ~0ull ? "not running" : "running", hosted.size());
-    return false;
-  }
   uint32_t target_ip = 0;
   {
     std::lock_guard lock(mutex);
     for (const auto& [id, a] : remotes) {
       if (a.host_xuid == invitee_xuid) target_ip = a.host_ip;
     }
+    for (const auto& [ip, p] : peers) {
+      if (!target_ip && p.xuid == invitee_xuid) target_ip = ip;
+    }
   }
   if (!target_ip) {
     REXKRNL_WARN("LAN lobby: invitee {:016X} is not on the LAN", invitee_xuid);
     return false;
   }
-  Writer w;
-  w.u32(kInviteMagic);
-  w.u8(kVersion);
-  w.u32(REX_KERNEL_STATE()->title_id());
-  w.u64(inviter_xuid);
-  w.u64(invitee_xuid);
-  char tag[16] = {};
-  const std::string& override_tag = systemlink::gamertag_override();
-  const std::string name =
-      override_tag.empty() ? REX_KERNEL_STATE()->user_profile()->name() : override_tag;
-  std::strncpy(tag, name.c_str(), sizeof(tag) - 1);
-  w.bytes(tag, sizeof(tag));
-  w.bytes(&hosted.front().info, sizeof(XSESSION_INFO));
-  for (int i = 0; i < 3; ++i) {  // UDP: send a few copies
-    send_to(sock_t(sock), w.buf, target_ip, uint16_t(REXCVAR_GET(lan_lobby_port)));
-  }
-  REXKRNL_INFO("LAN lobby: sent game invite for session {:016X} to {}",
-               session_id(hosted.front().info), systemlink::ip_to_string(target_ip));
-  return true;
+  return send_invite_to(target_ip, invitee_xuid, inviter_xuid);
 }
 
 bool TakeAcceptedInvite(InviteInfo* out) {
   std::lock_guard lock(mutex);
   if (!accepted_invite) return false;
   *out = *accepted_invite;
+  return true;
+}
+
+std::vector<LanPeer> GetLanPeers() {
+  Start();
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<LanPeer> out;
+  std::lock_guard lock(mutex);
+  for (const auto& [ip, p] : peers) {
+    LanPeer peer;
+    peer.ip = ip;
+    peer.address = systemlink::ip_to_string(ip);
+    peer.gamertag = p.gamertag;
+    peer.xuid = p.xuid;
+    peer.in_world = p.in_world;
+    peer.seconds_since_seen =
+        int(std::chrono::duration_cast<std::chrono::seconds>(now - p.last_seen).count());
+    for (const auto& [id, a] : remotes) {
+      if (a.host_ip == ip) {
+        peer.in_world = true;
+        peer.joinable = a.used_public + a.used_private < a.max_public + a.max_private;
+        if (peer.gamertag.empty()) peer.gamertag = a.gamertag;
+        if (!peer.xuid) peer.xuid = a.host_xuid;
+      }
+    }
+    out.push_back(std::move(peer));
+  }
+  return out;
+}
+
+LobbyStatus GetLobbyStatus() {
+  Start();
+  LobbyStatus status;
+  status.networking_enabled = systemlink::enabled();
+  status.running = lobby_socket.load() != ~0ull;
+  status.in_world = !session::HostedSessions().empty();
+  status.port = uint16_t(REXCVAR_GET(lan_lobby_port));
+  if (status.networking_enabled) {
+    status.game_address = systemlink::ip_to_string(systemlink::local_ip());
+    status.online_xuid = own_online_xuid();
+    for (const auto& a : systemlink::adapters()) {
+      status.adapters.push_back(a.name + "  " + systemlink::ip_to_string(a.ip));
+    }
+  }
+  std::lock_guard lock(mutex);
+  status.last_event = last_event;
+  return status;
+}
+
+bool JoinLanPeer(uint32_t ip) {
+  REXKRNL_INFO("LAN lobby: co-op menu join {}", systemlink::ip_to_string(ip));
+  return join_remote(ip);
+}
+
+bool InviteLanPeer(uint32_t ip) {
+  uint64_t xuid = 0;
+  std::string name;
+  {
+    std::lock_guard lock(mutex);
+    auto it = peers.find(ip);
+    if (it == peers.end()) {
+      last_event = "That player is no longer on the network";
+      return false;
+    }
+    xuid = it->second.xuid;
+    name = it->second.gamertag;
+  }
+  REXKRNL_INFO("LAN lobby: co-op menu invite {}", systemlink::ip_to_string(ip));
+  if (!send_invite_to(ip, xuid, own_online_xuid())) {
+    return false;
+  }
+  set_event("Invited " + (name.empty() ? systemlink::ip_to_string(ip) : name));
   return true;
 }
 

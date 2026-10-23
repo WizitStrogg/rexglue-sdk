@@ -2,6 +2,7 @@ EXPORTS
 ??0AchievementToastDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@PEAVImmediateDrawer@12@PEAVRuntime@2@@Z
 ??0AchievementsOverlayDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@PEAVImmediateDrawer@12@PEAVRuntime@2@PEAVAchievementManager@system@2@@Z
 ??0ConsoleDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@V?$shared_ptr@VLogCaptureSink@rex@@@std@@@Z
+??0CoopDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@Vpath@filesystem@std@@@Z
 ??0D3D12DescriptorHeapPool@d3d12@ui@rex@@QEAA@PEAUID3D12Device@@W4D3D12_DESCRIPTOR_HEAP_TYPE@@I@Z
 ??0D3D12UploadBufferPool@d3d12@ui@rex@@QEAA@AEBVD3D12Provider@123@_K@Z
 ??0DebugOverlayDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@V?$function@$$A6A?AUFrameStats@ui@rex@@XZ@std@@@Z
