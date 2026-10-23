@@ -11,6 +11,7 @@
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
+#include <rex/system/xenumerator.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/thread.h>
@@ -22,6 +23,8 @@
 #include <map>
 #include <mutex>
 #include <string>
+
+#include "../xam_lan_lobby.h"
 
 namespace rex {
 namespace kernel {
@@ -193,6 +196,71 @@ X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr, uint32_t buffer_l
   return X_E_SUCCESS;
 }
 
+// XFriendsCreateEnumerator. buffer_length points at an X_ARGUMENT_LIST
+// (32 entries of { u32 size; u32 pad; u64 value_ptr }, count at +0x200):
+// user index, starting index, amount, buffer-size out, handle out.
+// The list holds the players heard from on the LAN, shown as online friends
+// in this title so Fable II can draw their orbs.
+X_HRESULT XLiveBaseApp::XFriendsCreateEnumerator(uint32_t buffer_ptr, uint32_t args_ptr) {
+  if (!buffer_ptr || !args_ptr || !memory_->LookupHeap(args_ptr)) {
+    return X_E_INVALIDARG;
+  }
+  auto* args = memory_->TranslateVirtual<uint8_t*>(args_ptr);
+  if (memory::load_and_swap<uint32_t>(args + 0x200) != 5) {
+    return X_E_INVALIDARG;
+  }
+  auto arg_ptr = [&](int i) {
+    return static_cast<uint32_t>(memory::load_and_swap<uint64_t>(args + i * 0x10 + 8));
+  };
+  auto read_arg = [&](int i) {
+    const uint32_t ptr = arg_ptr(i);
+    return ptr ? memory::load_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(ptr)) : 0u;
+  };
+  const uint32_t user_index = read_arg(0);
+  const uint32_t starting_index = read_arg(1);
+  const uint32_t amount = read_arg(2);
+  const uint32_t buffer_size_ptr = arg_ptr(3);
+  const uint32_t handle_ptr = arg_ptr(4);
+  if (!handle_ptr || !buffer_size_ptr) {
+    return X_E_INVALIDARG;
+  }
+  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(handle_ptr), 0);
+  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(buffer_size_ptr), 0);
+  if (user_index != 0 || amount == 0 || amount > 100 || starting_index >= 100) {
+    return X_E_INVALIDARG;
+  }
+
+  constexpr size_t kFriendSize = 0xC4;  // X_ONLINE_FRIEND
+  auto e = object_ref<XStaticUntypedEnumerator>(
+      new XStaticUntypedEnumerator(kernel_state_, amount, kFriendSize));
+  auto result = e->Initialize(0xFF, app_id(), 0x58021, 0x58022, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+  const auto players = lobby::RemotePlayers();
+  for (size_t i = starting_index; i < players.size(); ++i) {
+    const auto& p = players[i];
+    uint8_t* item = e->AppendItem();
+    std::memset(item, 0, kFriendSize);
+    memory::store_and_swap<uint64_t>(item + 0x00, p.xuid);
+    std::memcpy(item + 0x08, p.gamertag, 15);
+    // XONLINE_FRIENDSTATE_FLAG_ONLINE | PLAYING | (JOINABLE)
+    uint32_t state = 0x1 | 0x2 | (p.joinable ? 0x10 : 0);
+    memory::store_and_swap<uint32_t>(item + 0x18, state);
+    std::memcpy(item + 0x1C, p.session_id, 8);
+    memory::store_and_swap<uint32_t>(item + 0x24, p.title_id);
+  }
+  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(buffer_size_ptr),
+                                   uint32_t(amount * kFriendSize));
+  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(handle_ptr), e->handle());
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8 || !players.empty()) {
+    REXKRNL_INFO("XFriendsCreateEnumerator start={} amount={} -> {} LAN player(s)", starting_index,
+                 amount, players.size() > starting_index ? players.size() - starting_index : 0);
+  }
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
@@ -219,13 +287,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return 0x80151802;  // ERROR_CONNECTION_INVALID
     }
     case 0x00058020: {
-      // 0x00058004 is called right before this.
-      // We should create a XamEnumerate-able empty list here, but I'm not
-      // sure of the format.
-      // buffer_length seems to be the same ptr sent to 0x00058004.
-      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) unimplemented", buffer_ptr,
-                    buffer_length);
-      return X_E_FAIL;
+      return XFriendsCreateEnumerator(buffer_ptr, buffer_length);
     }
     case 0x00058023: {
       REXKRNL_DEBUG(

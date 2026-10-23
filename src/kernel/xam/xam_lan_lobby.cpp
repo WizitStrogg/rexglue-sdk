@@ -522,4 +522,22 @@ X_HRESULT SearchByIds(uint8_t* buffer, [[maybe_unused]] uint32_t buffer_length) 
   return write_results(found, results_ptr, results_size);
 }
 
+std::vector<RemotePlayer> RemotePlayers() {
+  std::vector<RemotePlayer> out;
+  for (const auto& a : snapshot_remotes()) {
+    if (std::any_of(out.begin(), out.end(),
+                    [&](const RemotePlayer& p) { return p.xuid == a.host_xuid; })) {
+      continue;
+    }
+    RemotePlayer p{};
+    p.xuid = a.host_xuid;
+    std::memcpy(p.gamertag, a.gamertag, sizeof(p.gamertag));
+    std::memcpy(p.session_id, a.info.sessionID.ab, sizeof(p.session_id));
+    p.title_id = a.title_id;
+    p.joinable = a.used_public + a.used_private < a.max_public + a.max_private;
+    out.push_back(p);
+  }
+  return out;
+}
+
 }  // namespace rex::kernel::xam::lobby
