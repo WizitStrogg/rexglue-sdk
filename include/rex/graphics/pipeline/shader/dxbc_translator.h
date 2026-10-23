@@ -236,6 +236,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // taking into account the potential relation with occlusion queries (but
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    // Host render target path: clamp the color written to a k_2_10_10_10_FLOAT
+    // render target (stored on the host as unclamped float16) to the range the
+    // guest 7e3 format can represent, dropping NaN, like the Xbox 360 does.
+    // After the ROV flags so the shifts referenced by prebuilt shaders don't
+    // change.
+    kSysFlag_ClampColor0To7e3_Shift,
+    kSysFlag_ClampColor1To7e3_Shift,
+    kSysFlag_ClampColor2To7e3_Shift,
+    kSysFlag_ClampColor3To7e3_Shift,
 
     kSysFlag_Count,
 
@@ -260,6 +269,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_ClampColor0To7e3 = 1u << kSysFlag_ClampColor0To7e3_Shift,
+    kSysFlag_ClampColor1To7e3 = 1u << kSysFlag_ClampColor1To7e3_Shift,
+    kSysFlag_ClampColor2To7e3 = 1u << kSysFlag_ClampColor2To7e3_Shift,
+    kSysFlag_ClampColor3To7e3 = 1u << kSysFlag_ClampColor3To7e3_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

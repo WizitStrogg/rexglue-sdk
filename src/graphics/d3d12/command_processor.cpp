@@ -47,6 +47,13 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_clamp_7e3_render_targets, true, "GPU/D3D12",
+                    "With host render targets, clamp colors written to 7e3 floating-point "
+                    "(k_2_10_10_10_FLOAT) render targets to 0...31.875 and drop NaN like the "
+                    "Xbox 360. The host stores them as unclamped float16, so out-of-range values "
+                    "can grow into glowing white / blue patches over time.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -3717,6 +3724,16 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     for (uint32_t i = 0; i < 4; ++i) {
       if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
         flags |= DxbcShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+      }
+    }
+  }
+  // 7e3 range on the host render target path (the ROV path clamps by itself).
+  if (!edram_rov_used && REXCVAR_GET(d3d12_clamp_7e3_render_targets)) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      xenos::ColorRenderTargetFormat color_format = color_infos[i].color_format;
+      if (color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+          color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+        flags |= DxbcShaderTranslator::kSysFlag_ClampColor0To7e3 << i;
       }
     }
   }
