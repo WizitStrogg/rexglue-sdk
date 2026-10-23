@@ -167,6 +167,11 @@ class CommandProcessor {
   virtual void OnGammaRamp256EntryTableValueWritten() {}
   virtual void OnGammaRampPWLValueWritten() {}
 
+  // Called before the command processor makes something the guest CPU can
+  // observe (memory writes like fences, interrupts, swaps), so GPU results the
+  // CPU may read after it can be made visible first.
+  virtual void OnBeforeGuestVisibleWrite() {}
+
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
