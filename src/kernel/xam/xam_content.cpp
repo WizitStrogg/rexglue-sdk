@@ -220,6 +220,16 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
 
+    // Save-slot trace for co-op campaigns (Fable-2-Recomp specs/001, proof P4):
+    // which slot is opened, how (flags & 0xF: 1 new, 2 always-create = the
+    // folder is deleted first, 3 open, 4 open-always, 5 truncate) and where.
+    REXKRNL_INFO("[content] create root={} file={} type={:08X} flags={:X} disposition={} "
+                 "result={:08X} path={}",
+                 root_name, content_data.file_name(),
+                 static_cast<uint32_t>(XContentType(content_data.content_type)), flags,
+                 static_cast<int>(disposition), result,
+                 content_manager->GetOpenPackagePath(root_name).string());
+
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
     return result;
@@ -276,7 +286,11 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  auto* content_manager = REX_KERNEL_STATE()->content_manager();
+  const auto path = content_manager->GetOpenPackagePath(root_name.value());
+  auto result = content_manager->CloseContent(root_name.value());
+  REXKRNL_INFO("[content] close root={} result={:08X} path={}", root_name.value(), result,
+               path.string());
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
