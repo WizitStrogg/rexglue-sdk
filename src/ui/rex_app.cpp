@@ -64,6 +64,14 @@ ReXApp::ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo 
                std::string_view usage)
     : WindowedApp(ctx, name, usage), ppc_info_(ppc_info) {}
 
+void ReXApp::RefreshOverlayOpen() {
+  // The debug overlay (F3) is a passive readout people keep open while
+  // playing, so it does not count as a menu that needs the mouse.
+  any_overlay_open_.store(console_overlay_ || settings_overlay_ || coop_overlay_ ||
+                              achievements_overlay_,
+                          std::memory_order_relaxed);
+}
+
 std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
   if (!runtime_ || !runtime_->kernel_state() || !imgui_drawer_ || !immediate_drawer_) {
     return nullptr;
@@ -430,6 +438,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       debug_overlay_ =
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
+    RefreshOverlayOpen();
   });
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
@@ -437,6 +446,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
+    RefreshOverlayOpen();
   });
   rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
     if (settings_overlay_) {
@@ -444,6 +454,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
+    RefreshOverlayOpen();
   });
   rex::ui::RegisterBind("bind_coop", "F6", "Toggle co-op overlay", [this] {
     if (coop_overlay_) {
@@ -451,6 +462,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       coop_overlay_ = std::make_unique<ui::CoopDialog>(imgui_drawer_.get(), config_path_);
     }
+    RefreshOverlayOpen();
   });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
@@ -458,6 +470,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       achievements_overlay_ = CreateAchievementsOverlay();
     }
+    RefreshOverlayOpen();
   });
 
   OnCreateDialogs(imgui_drawer_.get());
@@ -611,6 +624,7 @@ void ReXApp::OnDestroy() {
   settings_overlay_.reset();
   coop_overlay_.reset();
   console_overlay_.reset();
+  any_overlay_open_.store(false, std::memory_order_relaxed);
   debug_overlay_.reset();
   if (imgui_drawer_) {
     imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);

@@ -256,6 +256,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::ImmediateDrawer* immediate_drawer() const { return immediate_drawer_.get(); }
   system::AchievementManager& achievements() const;
 
+  /// True while an interactive host overlay (console, settings, co-op,
+  /// achievements) is open. Safe to call from any thread; host input drivers
+  /// use it to release the mouse and stop feeding keys to the guest.
+  bool IsAnyOverlayOpen() const { return any_overlay_open_.load(std::memory_order_relaxed); }
+
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
@@ -311,6 +316,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::CoopDialog> coop_overlay_;
+  std::atomic<bool> any_overlay_open_{false};
+  void RefreshOverlayOpen();
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
