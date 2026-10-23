@@ -8,6 +8,7 @@
 
 #include <rex/ui/overlay/lobby_panel.h>
 #include <imgui.h>
+#include <rex/logging/macros.h>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -33,6 +34,12 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
   {
     std::lock_guard<std::mutex> lock(g_view_mutex);
     view = g_view;
+  }
+  static size_t s_logged_size = ~size_t(0);
+  if (view.size() != s_logged_size) {
+    s_logged_size = view.size();
+    REXLOG_INFO("[lobby-panel] draw: view {} bytes, display {}x{}", view.size(), io.DisplaySize.x,
+                io.DisplaySize.y);
   }
   if (view.empty()) return;
 
