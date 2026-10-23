@@ -1144,6 +1144,23 @@ LobbyStatus GetLobbyStatus() {
   }
   std::lock_guard lock(mutex);
   status.last_event = last_event;
+  if (status.joined_host_ip == 0) {
+    // Fable II joins a co-op game without creating a client session: it keeps
+    // its own hosted session and registers the host's session key. A
+    // registered key that belongs to another player's advertised session
+    // means we are in their game. Remember the host in case their advert
+    // stops arriving while we are there.
+    static uint64_t joined_key = 0;
+    static uint32_t joined_key_ip = 0;
+    const uint64_t key = systemlink::registered_session_id();
+    if (key != 0) {
+      if (auto it = remotes.find(key); it != remotes.end() && it->second.host_ip != 0) {
+        joined_key = key;
+        joined_key_ip = it->second.host_ip;
+      }
+      if (key == joined_key) status.joined_host_ip = joined_key_ip;
+    }
+  }
   return status;
 }
 
