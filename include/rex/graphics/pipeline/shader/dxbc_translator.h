@@ -245,6 +245,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ClampColor1To7e3_Shift,
     kSysFlag_ClampColor2To7e3_Shift,
     kSysFlag_ClampColor3To7e3_Shift,
+    // Same for a blended 7e3 render target, where the guest clamps the blending
+    // result, which the host can't do: only NaN and the upper bound are
+    // applied to the source, so negative sources can still darken.
+    kSysFlag_ClampBlendedColor0To7e3_Shift,
+    kSysFlag_ClampBlendedColor1To7e3_Shift,
+    kSysFlag_ClampBlendedColor2To7e3_Shift,
+    kSysFlag_ClampBlendedColor3To7e3_Shift,
 
     kSysFlag_Count,
 
@@ -273,6 +280,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ClampColor1To7e3 = 1u << kSysFlag_ClampColor1To7e3_Shift,
     kSysFlag_ClampColor2To7e3 = 1u << kSysFlag_ClampColor2To7e3_Shift,
     kSysFlag_ClampColor3To7e3 = 1u << kSysFlag_ClampColor3To7e3_Shift,
+    kSysFlag_ClampBlendedColor0To7e3 = 1u << kSysFlag_ClampBlendedColor0To7e3_Shift,
+    kSysFlag_ClampBlendedColor1To7e3 = 1u << kSysFlag_ClampBlendedColor1To7e3_Shift,
+    kSysFlag_ClampBlendedColor2To7e3 = 1u << kSysFlag_ClampBlendedColor2To7e3_Shift,
+    kSysFlag_ClampBlendedColor3To7e3 = 1u << kSysFlag_ClampBlendedColor3To7e3_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

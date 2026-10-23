@@ -3731,10 +3731,21 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   if (!edram_rov_used && REXCVAR_GET(d3d12_clamp_7e3_render_targets)) {
     for (uint32_t i = 0; i < 4; ++i) {
       xenos::ColorRenderTargetFormat color_format = color_infos[i].color_format;
-      if (color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-          color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
-        flags |= DxbcShaderTranslator::kSysFlag_ClampColor0To7e3 << i;
+      if (color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT &&
+          color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+        continue;
       }
+      auto blendcontrol =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+      bool blended = blendcontrol.color_srcblend != xenos::BlendFactor::kOne ||
+                     blendcontrol.color_destblend != xenos::BlendFactor::kZero ||
+                     blendcontrol.color_comb_fcn != xenos::BlendOp::kAdd ||
+                     blendcontrol.alpha_srcblend != xenos::BlendFactor::kOne ||
+                     blendcontrol.alpha_destblend != xenos::BlendFactor::kZero ||
+                     blendcontrol.alpha_comb_fcn != xenos::BlendOp::kAdd;
+      flags |= (blended ? DxbcShaderTranslator::kSysFlag_ClampBlendedColor0To7e3
+                        : DxbcShaderTranslator::kSysFlag_ClampColor0To7e3)
+               << i;
     }
   }
   if (edram_rov_used && depth_stencil_enabled) {
