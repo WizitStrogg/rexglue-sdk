@@ -90,6 +90,46 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
     rex::cvar::SetFlagByName("lan_auto_accept_invites", auto_accept ? "true" : "false");
   }
 
+  // Game-specific co-op options, shown when the game defines them (the
+  // overlay only knows them by name).
+  if (!rex::cvar::GetFlagByName("coop_own_hero").empty()) {
+    bool own_hero = rex::cvar::Query<bool>("coop_own_hero");
+    ImGui::SetCursorPosX(110.0f);
+    if (ImGui::Checkbox("Partners appear as their own hero (experimental)", &own_hero)) {
+      rex::cvar::SetFlagByName("coop_own_hero", own_hero ? "true" : "false");
+    }
+  }
+  const std::string story_sync = rex::cvar::GetFlagByName("coop_story_sync");
+  if (!story_sync.empty()) {
+    static const char* kChoices[] = {"ask", "always", "never"};
+    int current = 0;
+    for (int i = 0; i < 3; ++i) {
+      if (story_sync == kChoices[i]) current = i;
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Story");
+    ImGui::SameLine(110.0f);
+    ImGui::SetNextItemWidth(120.0f);
+    if (ImGui::Combo("##storysync", &current, kChoices, 3)) {
+      rex::cvar::SetFlagByName("coop_story_sync", kChoices[current]);
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(kMuted, "bring the host's story into my save (forward only)");
+    const std::string pending = rex::cvar::GetFlagByName("coop_story_pending");
+    if (!pending.empty()) {
+      ImGui::SetCursorPosX(110.0f);
+      ImGui::TextColored(kWarn, "Story waiting: %s", pending.c_str());
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Apply##story")) {
+        rex::cvar::InvokeCommand("coop_story_apply", "");
+      }
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Discard##story")) {
+        rex::cvar::InvokeCommand("coop_story_discard", "");
+      }
+    }
+  }
+
   // --- Players -------------------------------------------------------------
   ImGui::SeparatorText("Players on your network");
   if (!status.networking_enabled) {
