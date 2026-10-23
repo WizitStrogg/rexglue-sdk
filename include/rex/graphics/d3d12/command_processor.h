@@ -368,6 +368,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  // Re-marks memexport destinations as GPU-written after the readback was
+  // copied to guest memory, so the CPU write doesn't make the GPU data stale.
+  void RestoreMemexportRangesAfterReadback();
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.

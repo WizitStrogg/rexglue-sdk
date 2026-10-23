@@ -2784,10 +2784,25 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
   }
+  RestoreMemexportRangesAfterReadback();
 
   D3D12_RANGE readback_write_range = {};
   readback_buffer->Unmap(0, &readback_write_range);
   return true;
+}
+
+void D3D12CommandProcessor::RestoreMemexportRangesAfterReadback() {
+  // Copying the readback to guest memory is a CPU write to watched pages, which
+  // invalidates them in the shared memory, so the next GPU use would upload the
+  // guest memory over what the GPU wrote. The GPU buffer already holds the
+  // latest data (with the fast path, the guest memory is one memexport draw
+  // older - uploading it would roll back the GPU's results, which titles that
+  // simulate on the GPU over frames, like Fable II, accumulate into garbage).
+  // Mark the ranges as GPU-written again.
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+                                      memexport_range.size_bytes);
+  }
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_size) {
@@ -2892,6 +2907,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
   }
+  RestoreMemexportRangesAfterReadback();
   readback.current_index = read_index;
   return true;
 }
