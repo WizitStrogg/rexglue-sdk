@@ -26,6 +26,7 @@ class XLiveBaseApp : public system::xam::App {
                                 uint32_t buffer_length) override;
 
  private:
+  X_HRESULT XStorageBuildServerPath(uint32_t buffer_ptr);
   void LogUnimplemented(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length);
 };
 

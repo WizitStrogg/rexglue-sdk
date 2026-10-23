@@ -11,9 +11,13 @@
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/thread.h>
 
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -82,6 +86,69 @@ void XLiveBaseApp::LogUnimplemented(uint32_t message, uint32_t buffer_ptr,
   }
 }
 
+// Fable II asks for the server path of its title-storage files (items.dat,
+// orb settings) every frame until it gets one. Hand back the console's path
+// format; the matching download then reports the file as missing.
+X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
+  if (!buffer_ptr) {
+    return X_E_INVALIDARG;
+  }
+  // { u32 user_index; u64 xuid (8-aligned); u32 facility; u32 info_ptr;
+  //   u32 info_size; u32 file_name_ptr; u32 server_path_ptr; u32 server_path_length_ptr; }
+  auto* args = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
+  const uint64_t xuid_arg = memory::load_and_swap<uint64_t>(args + 0x08);
+  const uint32_t facility = memory::load_and_swap<uint32_t>(args + 0x10);
+  const uint32_t file_name_ptr = memory::load_and_swap<uint32_t>(args + 0x1C);
+  const uint32_t server_path_ptr = memory::load_and_swap<uint32_t>(args + 0x20);
+  const uint32_t server_path_length_ptr = memory::load_and_swap<uint32_t>(args + 0x24);
+
+  std::string file_name;
+  if (file_name_ptr) {
+    auto* name = memory_->TranslateVirtual<uint8_t*>(file_name_ptr);
+    for (uint32_t i = 0; i < 256; ++i) {
+      const uint16_t c = memory::load_and_swap<uint16_t>(name + i * 2);
+      if (!c) break;
+      file_name.push_back(c < 0x80 ? char(c) : '_');
+    }
+  }
+  const uint32_t title_id = kernel_state_->title_id();
+  char path[512];
+  switch (facility) {
+    case 2:  // per title
+      std::snprintf(path, sizeof(path), "//title.%08x/t:%08x/%s", title_id, title_id,
+                    file_name.c_str());
+      break;
+    case 3: {  // per user, per title
+      const uint64_t xuid = xuid_arg ? xuid_arg : kernel_state_->user_profile()->xuid();
+      std::snprintf(path, sizeof(path), "//tuser.%08x/u:%016llx/%08x/%s", title_id,
+                    static_cast<unsigned long long>(xuid), title_id, file_name.c_str());
+      break;
+    }
+    default:
+      return 0x8015C009;  // X_ONLINE_E_STORAGE_INVALID_FACILITY
+  }
+  const uint32_t chars = uint32_t(std::strlen(path)) + 1;
+  if (server_path_length_ptr) {
+    auto* length = memory_->TranslateVirtual<uint8_t*>(server_path_length_ptr);
+    const uint32_t capacity = memory::load_and_swap<uint32_t>(length);
+    if (server_path_ptr && capacity < chars) {
+      return X_E_INVALIDARG;
+    }
+    memory::store_and_swap<uint32_t>(length, chars);
+  }
+  if (server_path_ptr) {
+    auto* out = memory_->TranslateVirtual<uint8_t*>(server_path_ptr);
+    for (uint32_t i = 0; i < chars; ++i) {
+      memory::store_and_swap<uint16_t>(out + i * 2, uint8_t(path[i]));
+    }
+  }
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 8) {
+    REXKRNL_INFO("XStorageBuildServerPath facility={} file='{}' -> {}", facility, file_name, path);
+  }
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
@@ -129,6 +196,14 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // input
       REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) unimplemented", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
+    }
+    case 0x00058035: {
+      return XStorageBuildServerPath(buffer_ptr);
+    }
+    case 0x00050009: {
+      // XStorageDownloadToMemory: there is no LIVE title storage to fetch from.
+      REXKRNL_DEBUG("XStorageDownloadToMemory({:08X}) -> file not found", buffer_ptr);
+      return 0x8015C004;  // X_ONLINE_E_STORAGE_FILE_NOT_FOUND
     }
     case 0x00058037: {
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
