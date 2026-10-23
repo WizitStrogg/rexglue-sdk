@@ -114,6 +114,9 @@ void create_key(XNKID* kid, XNKEY* key);
 
 // Session key the title registered most recently (0 if none).
 uint64_t registered_session_id();
+// network_isolate: only the network_interface address is used (sockets bind
+// to it, other adapters are ignored), so two copies can share one PC.
+bool isolated();
 void set_registered_session_id(uint64_t id);
 
 // XUID the guest sees through XamUser* APIs (cvar profile_xuid).

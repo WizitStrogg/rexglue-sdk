@@ -733,7 +733,11 @@ void run() {
   sockaddr_in bind_addr{};
   bind_addr.sin_family = AF_INET;
   bind_addr.sin_port = htons(port);
-  bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  // network_isolate: only this copy's address, so a second copy on the same PC
+  // (another address) can bind the same port. Broadcasts may then not arrive;
+  // list the other copy in lan_peers.
+  bind_addr.sin_addr.s_addr =
+      htonl(systemlink::isolated() ? systemlink::local_ip() : uint32_t(INADDR_ANY));
   if (bind(s, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
     REXKRNL_ERROR("LAN lobby: could not bind UDP port {} (is another copy running?)", port);
     set_event("UDP port " + std::to_string(port) + " is in use (another copy running?)");
@@ -1144,23 +1148,9 @@ LobbyStatus GetLobbyStatus() {
   }
   std::lock_guard lock(mutex);
   status.last_event = last_event;
-  if (status.joined_host_ip == 0) {
-    // Fable II joins a co-op game without creating a client session: it keeps
-    // its own hosted session and registers the host's session key. A
-    // registered key that belongs to another player's advertised session
-    // means we are in their game. Remember the host in case their advert
-    // stops arriving while we are there.
-    static uint64_t joined_key = 0;
-    static uint32_t joined_key_ip = 0;
-    const uint64_t key = systemlink::registered_session_id();
-    if (key != 0) {
-      if (auto it = remotes.find(key); it != remotes.end() && it->second.host_ip != 0) {
-        joined_key = key;
-        joined_key_ip = it->second.host_ip;
-      }
-      if (key == joined_key) status.joined_host_ip = joined_key_ip;
-    }
-  }
+  // joined_host_ip comes only from a real client (JOINING) session. A
+  // registered session key is not enough: each game registers the other
+  // player's key as soon as it shows their orb, while still in its own world.
   return status;
 }
 

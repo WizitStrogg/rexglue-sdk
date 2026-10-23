@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 
@@ -221,6 +222,10 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
+namespace {
+std::atomic<rex_input_state_filter_fn> g_state_filter{nullptr};
+}  // namespace
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -254,6 +259,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (auto filter = g_state_filter.load()) {
+    filter(user_index, &merged);
   }
   if (out_state) {
     *out_state = merged;
@@ -368,3 +376,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
 }
 
 }  // namespace rex::input
+
+extern "C" void rex_input_set_state_filter(rex::input::rex_input_state_filter_fn filter) {
+  rex::input::g_state_filter.store(filter);
+}

@@ -493,6 +493,9 @@ int XSocket::Bind(const XSOCKADDR_IN* name, int /*name_len*/) {
                  systemlink::ip_to_string(ip));
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
   }
+  if (systemlink::isolated() && addr.sin_addr.s_addr == htonl(INADDR_ANY)) {
+    addr.sin_addr.s_addr = htonl(systemlink::local_ip());  // network_isolate
+  }
   int ret = ::bind(to_native(native_handle_), reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
   if (ret < 0) {
     REXKRNL_WARN("XSocket::Bind: port {} failed ({})", uint16_t(name->sin_port), LastError());

@@ -103,10 +103,8 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
     }
   };
   option_checkbox("coop_lua_runner", "Run co-op scripts (untick if the game misbehaves)");
-  option_checkbox("coop_own_hero", "Partners appear as their own hero (experimental)");
-  option_checkbox("coop_own_camera", "My camera follows only my hero (experimental)");
-  option_checkbox("coop_camera_follow_partner",
-                  "In someone else's game, aim my camera at my own character");
+  option_checkbox("coop_own_camera",
+                  "In someone else's game, my camera follows my own hero (mouse/right stick turns it)");
   auto option_metres = [](const char* cvar, const char* label, int max_m) {
     if (rex::cvar::GetFlagByName(cvar).empty()) return;
     int value = rex::cvar::Query<int32_t>(cvar);

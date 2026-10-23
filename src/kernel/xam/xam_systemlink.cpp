@@ -46,6 +46,12 @@ REXCVAR_DEFINE_STRING(network_interface, "",
                       "or Hamachi address). Empty = pick the first private LAN adapter; the LAN "
                       "lobby still announces on every adapter")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(network_isolate, false, "Network",
+                    "Use only the network_interface address: bind the game's sockets and the "
+                    "LAN lobby to it and ignore other adapters. Lets two copies run on one PC "
+                    "with different network_interface values (testing); the online XUID then "
+                    "also depends on the address")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(profile_xuid, "", "Network",
                       "Player identity. Empty or 'auto' = keep the built-in offline XUID (which "
                       "owns the saves) and, with networking on, derive a per-PC online XUID "
@@ -186,6 +192,14 @@ const State& state() {
           chosen = &a;
         }
       }
+      if (!chosen && wanted && (wanted >> 24) == 127 && REXCVAR_GET(network_isolate)) {
+        // Two copies on one PC: Windows does not deliver local traffic between
+        // two adapters' addresses (strong host model), but 127.x.y.z works.
+        st.ip = wanted;
+        st.broadcast = wanted;
+        REXKRNL_INFO("SystemLink: enabled on loopback {} (network_isolate)", iface);
+        return st;
+      }
       if (!chosen && wanted) {
         REXKRNL_ERROR("SystemLink: no adapter has address {}", iface);
       }
@@ -274,6 +288,10 @@ uint32_t local_ip() {
   return state().ip;
 }
 
+bool isolated() {
+  return enabled() && REXCVAR_GET(network_isolate) && state().ip != 0;
+}
+
 uint32_t broadcast_ip() {
   return state().broadcast;
 }
@@ -288,9 +306,20 @@ std::vector<LocalAdapter> adapters() {
   const auto now = std::chrono::steady_clock::now();
   if (cached_adapters.empty() || now - adapters_time > std::chrono::seconds(5)) {
     std::vector<LocalAdapter> fresh;
+    if (isolated() && (local_ip() >> 24) == 127) {
+      LocalAdapter out;  // network_isolate on a loopback address
+      out.ip = local_ip();
+      out.mask = 0xFFFFFFFFu;
+      out.broadcast = local_ip();
+      out.name = "loopback";
+      fresh.push_back(out);
+    }
     for (const auto& a : enumerate_adapters()) {
       if (!is_usable(a)) {
         continue;
+      }
+      if (isolated() && a.ip != local_ip()) {
+        continue;  // network_isolate: this copy owns only its own address
       }
       LocalAdapter out;
       out.ip = a.ip;
@@ -426,7 +455,9 @@ uint64_t online_xuid(uint64_t legacy_xuid) {
     } else {
       // Online XUID range (0x0009...), stable per PC name, so every PC in a
       // game is a different player without touching the save's owner.
-      result = 0x0009000000000000ull | (fnv1a64(host_name() + "/online") & 0x0000FFFFFFFFFFFFull);
+      std::string seed = host_name() + "/online";
+      if (isolated()) seed += "/" + ip_to_string(local_ip());  // two copies on one PC
+      result = 0x0009000000000000ull | (fnv1a64(seed) & 0x0000FFFFFFFFFFFFull);
     }
     REXKRNL_INFO("SystemLink: online XUID {:016X} (saves stay with {:016X})", result,
                  network_xuid(legacy_xuid));

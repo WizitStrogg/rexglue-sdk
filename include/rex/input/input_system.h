@@ -26,6 +26,11 @@ class Window;
 
 namespace rex::input {
 
+// Optional title hook: called with the merged pad state of every GetState
+// before it is returned to the guest (e.g. to remap sticks). Set from title
+// code with rex_input_set_state_filter.
+using rex_input_state_filter_fn = void (*)(uint32_t user_index, X_INPUT_STATE* state);
+
 class InputSystem : public system::IInputSystem {
  public:
   explicit InputSystem(rex::ui::Window* window);
