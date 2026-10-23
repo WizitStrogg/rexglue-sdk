@@ -204,7 +204,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     assert_not_null(xuids);
     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid() ||
+                static_cast<uint64_t>(xuids[0]) == guest_xuid());
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;

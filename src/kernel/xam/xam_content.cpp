@@ -11,6 +11,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/systemlink.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/hook.h>
@@ -300,7 +301,9 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
       // User always creates saves.
       *is_creator_ptr = 1;
       if (creator_xuid_ptr) {
-        *creator_xuid_ptr = xuid;
+        // Report the XUID the guest sees for this user, or titles that
+        // compare it against XamUserGetXUID reject their own saves.
+        *creator_xuid_ptr = systemlink::network_xuid(xuid);
       }
     } else {
       *is_creator_ptr = 0;
