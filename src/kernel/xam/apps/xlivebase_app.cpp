@@ -25,6 +25,7 @@
 #include <string>
 
 #include "../xam_lan_lobby.h"
+#include <rex/kernel/xam/systemlink.h>
 
 namespace rex {
 namespace kernel {
@@ -261,6 +262,69 @@ X_HRESULT XLiveBaseApp::XFriendsCreateEnumerator(uint32_t buffer_ptr, uint32_t a
   return X_E_SUCCESS;
 }
 
+// XInviteSend (async). Marshalled request, big endian: u32 user_index,
+// u32 invitee_count, u64 invitees[], u32 display_string_chars,
+// u16 display_string[], u32 xmsg_handle.
+X_HRESULT XLiveBaseApp::XInviteSend(uint32_t buffer_ptr, uint32_t buffer_length) {
+  if (!buffer_ptr || buffer_length != 0x28) {
+    return X_E_INVALIDARG;
+  }
+  const uint32_t task_ptr =
+      memory::load_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(buffer_ptr));
+  if (!task_ptr) {
+    return X_E_INVALIDARG;
+  }
+  auto* task = memory_->TranslateVirtual<uint8_t*>(task_ptr);
+  const uint32_t request_ptr = memory::load_and_swap<uint32_t>(task + 0x18);
+  const uint32_t request_size = memory::load_and_swap<uint32_t>(task + 0x1C);
+  if (!request_ptr || request_size < 8) {
+    return X_E_INVALIDARG;
+  }
+  auto* request = memory_->TranslateVirtual<uint8_t*>(request_ptr);
+  const uint32_t count = memory::load_and_swap<uint32_t>(request + 4);
+  if (count > 100 || 8 + count * 8 > request_size) {
+    return X_E_INVALIDARG;
+  }
+  const uint64_t inviter = systemlink::online_xuid(kernel_state_->user_profile()->xuid());
+  uint32_t sent = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t invitee = memory::load_and_swap<uint64_t>(request + 8 + i * 8);
+    REXKRNL_INFO("XInviteSend to {:016X}", invitee);
+    sent += lobby::SendInvite(invitee, inviter) ? 1 : 0;
+  }
+  return sent || !count ? X_E_SUCCESS : X_E_FAIL;
+}
+
+// XInviteGetAcceptedInfo. args_ptr is an X_ARGUMENT_LIST: user index,
+// X_INVITE_INFO out { u64 invitee; u64 inviter; u32 title_id;
+// XSESSION_INFO host_info; u32 from_game_invite }.
+X_HRESULT XLiveBaseApp::XInviteGetAcceptedInfo(uint32_t args_ptr) {
+  if (!args_ptr || !memory_->LookupHeap(args_ptr)) {
+    return X_E_INVALIDARG;
+  }
+  auto* args = memory_->TranslateVirtual<uint8_t*>(args_ptr);
+  const uint32_t info_ptr = static_cast<uint32_t>(memory::load_and_swap<uint64_t>(args + 0x18));
+  if (!info_ptr) {
+    return X_E_INVALIDARG;
+  }
+  lobby::InviteInfo invite;
+  if (!lobby::TakeAcceptedInvite(&invite)) {
+    REXKRNL_INFO("XInviteGetAcceptedInfo -> no invite");
+    return 0x80155200;  // X_ONLINE_E_SESSION_NOT_FOUND
+  }
+  auto* info = memory_->TranslateVirtual<uint8_t*>(info_ptr);
+  std::memset(info, 0, 0x54);
+  memory::store_and_swap<uint64_t>(info + 0x00,
+                                   systemlink::online_xuid(kernel_state_->user_profile()->xuid()));
+  memory::store_and_swap<uint64_t>(info + 0x08, invite.xuid_inviter);
+  memory::store_and_swap<uint32_t>(info + 0x10, invite.title_id);
+  std::memcpy(info + 0x14, &invite.host_info, sizeof(XSESSION_INFO));
+  memory::store_and_swap<uint32_t>(info + 0x50, 1);
+  REXKRNL_INFO("XInviteGetAcceptedInfo -> invite from '{}' to session {:016X}", invite.gamertag,
+               memory::load_and_swap<uint64_t>(invite.host_info.sessionID.ab));
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
@@ -290,11 +354,10 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return XFriendsCreateEnumerator(buffer_ptr, buffer_length);
     }
     case 0x00058023: {
-      REXKRNL_DEBUG(
-          "CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X}) "
-          "unimplemented",
-          buffer_ptr, buffer_length);
-      return X_E_FAIL;
+      return XInviteGetAcceptedInfo(buffer_length);
+    }
+    case 0x00050002: {
+      return XInviteSend(buffer_ptr, buffer_length);
     }
     case 0x00058046: {
       // Required to be successful for 4D530910 to detect signed-in profile

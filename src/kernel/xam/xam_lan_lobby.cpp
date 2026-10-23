@@ -23,6 +23,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -53,6 +54,10 @@ REXCVAR_DEFINE_UINT32(lan_lobby_port, 3075, "Network",
 REXCVAR_DEFINE_STRING(lan_peers, "", "Network",
                       "Comma-separated IPv4 addresses that also receive session announcements, "
                       "for networks where broadcast does not reach the other PC");
+
+REXCVAR_DEFINE_BOOL(lan_auto_accept_invites, true, "Network",
+                    "Accept game invites from LAN players immediately (there is no Xbox "
+                    "guide to accept them from)");
 
 namespace rex::kernel::xam::lobby {
 
@@ -244,6 +249,36 @@ void send_to(sock_t s, const std::vector<uint8_t>& packet, uint32_t ip, uint16_t
          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
+constexpr uint32_t kInviteMagic = 0x494C5852;  // 'RXLI'
+
+std::atomic<uint64_t> lobby_socket{~0ull};
+std::optional<InviteInfo> accepted_invite;  // guarded by mutex
+
+void handle_invite(const uint8_t* data, size_t size, uint32_t from_ip) {
+  Reader r{data, size};
+  if (r.u32() != kInviteMagic || r.u8() != kVersion) return;
+  InviteInfo invite{};
+  invite.title_id = r.u32();
+  invite.xuid_inviter = r.u64();
+  invite.xuid_invitee = r.u64();
+  r.bytes(invite.gamertag, sizeof(invite.gamertag));
+  invite.gamertag[15] = 0;
+  r.bytes(&invite.host_info, sizeof(invite.host_info));
+  if (!r.ok || invite.title_id != REX_KERNEL_STATE()->title_id()) return;
+  systemlink::xnaddr_from_ip(from_ip, &invite.host_info.hostAddress);
+  REXKRNL_INFO("LAN lobby: game invite from '{}' ({}) to session {:016X}", invite.gamertag,
+               systemlink::ip_to_string(from_ip), session_id(invite.host_info));
+  {
+    std::lock_guard lock(mutex);
+    accepted_invite = invite;
+  }
+  if (REXCVAR_GET(lan_auto_accept_invites)) {
+    // XN_LIVE_INVITE_ACCEPTED for user 0.
+    REX_KERNEL_STATE()->BroadcastNotification(0x02000002, 0);
+    REXKRNL_INFO("LAN lobby: invite accepted automatically");
+  }
+}
+
 void run() {
 #if REX_PLATFORM_WIN32
   WSADATA wsa;
@@ -267,6 +302,7 @@ void run() {
     close_socket(s);
     return;
   }
+  lobby_socket.store(uint64_t(s));
   const uint32_t self = systemlink::local_ip();
   const auto peers = peer_ips();
   REXKRNL_INFO("LAN lobby: listening on UDP {} (broadcast {}, {} extra peer(s))", port,
@@ -314,6 +350,10 @@ void run() {
     }
     const uint32_t from_ip = ntohl(from.sin_addr.s_addr);
     if (from_ip == self) {
+      continue;
+    }
+    if (n >= 4 && Reader{packet.data(), size_t(n)}.u32() == kInviteMagic) {
+      handle_invite(packet.data(), size_t(n), from_ip);
       continue;
     }
     Advert advert;
@@ -538,6 +578,53 @@ std::vector<RemotePlayer> RemotePlayers() {
     out.push_back(p);
   }
   return out;
+}
+
+bool SendInvite(uint64_t invitee_xuid, uint64_t inviter_xuid) {
+  const uint64_t sock = lobby_socket.load();
+  const auto hosted = session::HostedSessions();
+  if (sock == ~0ull || hosted.empty()) {
+    REXKRNL_WARN("LAN lobby: cannot send invite (lobby {}, {} hosted session(s))",
+                 sock == ~0ull ? "not running" : "running", hosted.size());
+    return false;
+  }
+  uint32_t target_ip = 0;
+  {
+    std::lock_guard lock(mutex);
+    for (const auto& [id, a] : remotes) {
+      if (a.host_xuid == invitee_xuid) target_ip = a.host_ip;
+    }
+  }
+  if (!target_ip) {
+    REXKRNL_WARN("LAN lobby: invitee {:016X} is not on the LAN", invitee_xuid);
+    return false;
+  }
+  Writer w;
+  w.u32(kInviteMagic);
+  w.u8(kVersion);
+  w.u32(REX_KERNEL_STATE()->title_id());
+  w.u64(inviter_xuid);
+  w.u64(invitee_xuid);
+  char tag[16] = {};
+  const std::string& override_tag = systemlink::gamertag_override();
+  const std::string name =
+      override_tag.empty() ? REX_KERNEL_STATE()->user_profile()->name() : override_tag;
+  std::strncpy(tag, name.c_str(), sizeof(tag) - 1);
+  w.bytes(tag, sizeof(tag));
+  w.bytes(&hosted.front().info, sizeof(XSESSION_INFO));
+  for (int i = 0; i < 3; ++i) {  // UDP: send a few copies
+    send_to(sock_t(sock), w.buf, target_ip, uint16_t(REXCVAR_GET(lan_lobby_port)));
+  }
+  REXKRNL_INFO("LAN lobby: sent game invite for session {:016X} to {}",
+               session_id(hosted.front().info), systemlink::ip_to_string(target_ip));
+  return true;
+}
+
+bool TakeAcceptedInvite(InviteInfo* out) {
+  std::lock_guard lock(mutex);
+  if (!accepted_invite) return false;
+  *out = *accepted_invite;
+  return true;
 }
 
 }  // namespace rex::kernel::xam::lobby

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <vector>
 
+#include <rex/kernel/xam/systemlink.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xam::lobby {
@@ -40,6 +41,19 @@ struct RemotePlayer {
   bool joinable;
 };
 std::vector<RemotePlayer> RemotePlayers();
+
+// Game invites between LAN players. SendInvite delivers our hosted
+// session to the invitee's machine; the receiver keeps it as the accepted
+// invite (and raises XN_LIVE_INVITE_ACCEPTED when lan_auto_accept_invites).
+struct InviteInfo {
+  uint64_t xuid_inviter;
+  uint64_t xuid_invitee;
+  uint32_t title_id;
+  char gamertag[16];
+  XSESSION_INFO host_info;
+};
+bool SendInvite(uint64_t invitee_xuid, uint64_t inviter_xuid);
+bool TakeAcceptedInvite(InviteInfo* out);
 
 // Starts the beacon thread (no-op when networking is off or already running).
 void Start();

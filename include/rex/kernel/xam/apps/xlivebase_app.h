@@ -27,6 +27,8 @@ class XLiveBaseApp : public system::xam::App {
 
  private:
   X_HRESULT XStorageBuildServerPath(uint32_t buffer_ptr);
+  X_HRESULT XInviteSend(uint32_t buffer_ptr, uint32_t buffer_length);
+  X_HRESULT XInviteGetAcceptedInfo(uint32_t args_ptr);
   X_HRESULT XFriendsCreateEnumerator(uint32_t buffer_ptr, uint32_t args_ptr);
   X_HRESULT XStorageEnumerate(uint32_t buffer_ptr, uint32_t buffer_length);
   void LogUnimplemented(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length);
