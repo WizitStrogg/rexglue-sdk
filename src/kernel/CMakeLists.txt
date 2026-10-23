@@ -14,6 +14,8 @@ set(REXKERNEL_SOURCES
     xam/xam_locale.cpp
     xam/xam_msg.cpp
     xam/xam_net.cpp
+    xam/xam_systemlink.cpp
+    xam/xam_session.cpp
     xam/xam_notify.cpp
     xam/xam_nui.cpp
     xam/xam_party.cpp

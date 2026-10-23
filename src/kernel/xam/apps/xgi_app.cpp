@@ -13,6 +13,8 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include "../xam_session.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -95,73 +97,27 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0010: {
       assert_true(!buffer_length || buffer_length == 28);
-      // Sequence:
-      // - XamSessionCreateHandle
-      // - XamSessionRefObjByHandle
-      // - [this]
-      // - CloseHandle
-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t num_slots_private = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t user_xuid = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
-
-      REXKRNL_DEBUG(
-          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
-          "{:08X})",
-          session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
-          nonce_ptr);
-      return X_E_SUCCESS;
+      return session::Create(buffer);
     }
     case 0x000B0011: {
       assert_true(!buffer_length || buffer_length == 16);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
-
-      REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
-
-      return X_E_SUCCESS;
+      return session::Delete(buffer);
     }
     case 0x000B0012: {
       assert_true(!buffer_length || buffer_length == 20);
-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t xuid_array_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t user_index_array = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
-      bool is_local = xuid_array_ptr == 0;
-
-      REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
-                    is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
-                    user_count, xuid_array_ptr, user_index_array, private_slots_array);
-      return X_E_SUCCESS;
+      return session::Join(buffer);
+    }
+    case 0x000B0013: {
+      assert_true(!buffer_length || buffer_length == 20);
+      return session::Leave(buffer);
     }
     case 0x000B0014: {
       assert_true(!buffer_length || buffer_length == 16);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
-
-      REXKRNL_DEBUG("XSessionStart({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
-
-      return X_STATUS_SUCCESS;
+      return session::Start(buffer);
     }
     case 0x000B0015: {
-      // send high scores?
       assert_true(!buffer_length || buffer_length == 16);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
-
-      REXKRNL_DEBUG("XSessionEnd({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
-
-      return X_E_SUCCESS;
+      return session::End(buffer);
     }
     case 0x000B0016: {
       assert_true(!buffer_length || buffer_length == 32);
@@ -183,16 +139,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0018: {
       assert_true(!buffer_length || buffer_length == 16);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t maxPublicSlots = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint16_t maxPrivateSlots = memory::load_and_swap<uint16_t>(buffer + 12);
-
-      REXKRNL_DEBUG("XSessionModify({:08X}, {:08X}, {:08X}, {:08X})", obj_ptr, flags,
-                    maxPublicSlots, maxPrivateSlots);
-
-      return X_E_SUCCESS;
+      return session::Modify(buffer);
     }
     case 0x000B001C: {
       assert_true(!buffer_length || buffer_length == 36);
@@ -218,33 +165,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B001D: {
       assert_true(!buffer_length || buffer_length == 24);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t details_buffer_size = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_details_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
-
-      REXKRNL_DEBUG("XSessionGetDetails({:08X}, {}, {:08X}, {}, {}, {})", obj_ptr,
-                    details_buffer_size, session_details_ptr, reserved1, reserved2, reserved3);
-
-      return X_E_SUCCESS;
+      return session::GetDetails(buffer);
     }
     case 0x000B001E: {
       assert_true(!buffer_length || buffer_length == 24);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
-
-      REXKRNL_DEBUG("XSessionMigrateHost({:08X}, {:08X}, {}, {}, {}, {})", obj_ptr,
-                    session_info_ptr, user_index, reserved1, reserved2, reserved3);
-
-      return X_E_SUCCESS;
+      return session::MigrateHost(buffer);
     }
     case 0x000B0019: {
       assert_true(!buffer_length || buffer_length == 8);

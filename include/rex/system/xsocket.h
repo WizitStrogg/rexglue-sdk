@@ -8,10 +8,17 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    2026 - Overlapped WSASendTo/WSARecvFrom, option/ioctl
+ *              translation and System Link broadcast handling, adapted from
+ *              the Xenia Canary netplay branch (AdrianCassar/xenia-canary).
  */
 
+#include <atomic>
 #include <cstring>
-#include <queue>
+#include <future>
+#include <map>
+#include <mutex>
+#include <set>
 
 #include <rex/math.h>
 #include <rex/system/xobject.h>
@@ -19,53 +26,87 @@
 
 namespace rex::system {
 
+enum class X_WSA_ERROR : uint32_t {
+  X_WSA_NO_ERROR = 0,
+  X_WSA_INVALID_PARAMETER = 87,
+  X_WSA_OPERATION_ABORTED = 995,
+  X_WSA_IO_INCOMPLETE = 996,
+  X_WSA_IO_PENDING = 997,
+  X_WSAEINTR = 10004,
+  X_WSAEBADF = 10009,
+  X_WSAEACCES = 10013,
+  X_WSAEFAULT = 10014,
+  X_WSAEINVAL = 10022,
+  X_WSAEMFILE = 10024,
+  X_WSAEWOULDBLOCK = 10035,
+  X_WSAEINPROGRESS = 10036,
+  X_WSAEALREADY = 10037,
+  X_WSAENOTSOCK = 10038,
+  X_WSAEDESTADDRREQ = 10039,
+  X_WSAEMSGSIZE = 10040,
+  X_WSAEPROTOTYPE = 10041,
+  X_WSAENOPROTOOPT = 10042,
+  X_WSAEPROTONOSUPPORT = 10043,
+  X_WSAESOCKTNOSUPPORT = 10044,
+  X_WSAEOPNOTSUPP = 10045,
+  X_WSAEPFNOSUPPORT = 10046,
+  X_WSAEAFNOSUPPORT = 10047,
+  X_WSAEADDRINUSE = 10048,
+  X_WSAEADDRNOTAVAIL = 10049,
+  X_WSAENETDOWN = 10050,
+  X_WSAENETUNREACH = 10051,
+  X_WSAENETRESET = 10052,
+  X_WSAECONNABORTED = 10053,
+  X_WSAECONNRESET = 10054,
+  X_WSAENOBUFS = 10055,
+  X_WSAEISCONN = 10056,
+  X_WSAENOTCONN = 10057,
+  X_WSAESHUTDOWN = 10058,
+  X_WSAETIMEDOUT = 10060,
+  X_WSAECONNREFUSED = 10061,
+  X_WSAEHOSTUNREACH = 10065,
+  X_WSASYSNOTREADY = 10091,
+  X_WSAVERNOTSUPPORTED = 10092,
+  X_WSANOTINITIALISED = 10093,
+  X_WSAECANCELLED = 10103,
+  X_WSASYSCALLFAILURE = 10107,
+};
+
+// Xbox-only socket options.
+constexpr uint32_t X_SO_MARKINSECURE = 0x5801;
+constexpr uint32_t X_SO_PRIVATE = 0x5802;
+constexpr uint32_t X_SO_GRANTINSECURE = 0x5803;
+
 struct XSOCKADDR {
   rex::be<uint16_t> address_family;
   char sa_data[14];
 };
+static_assert(sizeof(XSOCKADDR) == 0x10, "XSOCKADDR size");
 
-struct N_XSOCKADDR {
-  N_XSOCKADDR() {}
-  N_XSOCKADDR(const XSOCKADDR* other) { *this = *other; }
-  N_XSOCKADDR& operator=(const XSOCKADDR& other) {
-    address_family = other.address_family;
-    std::memcpy(sa_data, other.sa_data, rex::countof(sa_data));
-    return *this;
-  }
-
-  uint16_t address_family;
-  char sa_data[14];
-};
-
+// Guest sockaddr_in. Port and address are big-endian, i.e. network byte
+// order, exactly like the host's sockaddr_in fields.
 struct XSOCKADDR_IN {
   rex::be<uint16_t> sin_family;
-
-  // Always big-endian!
-  rex::be<uint16_t> sin_port;
-  rex::be<uint32_t> sin_addr;
-  // sin_zero is defined as __pad on Android, so prefixed here.
+  rex::be<uint16_t> sin_port;  // host-order value (byte-swapped by be<>)
+  rex::be<uint32_t> sin_addr;  // host-order value (byte-swapped by be<>)
   char x_sin_zero[8];
 };
+static_assert(sizeof(XSOCKADDR_IN) == 0x10, "XSOCKADDR_IN size");
 
-// Xenia native sockaddr_in
-struct N_XSOCKADDR_IN {
-  N_XSOCKADDR_IN() {}
-  N_XSOCKADDR_IN(const XSOCKADDR_IN* other) { *this = *other; }
-  N_XSOCKADDR_IN& operator=(const XSOCKADDR_IN& other) {
-    sin_family = other.sin_family;
-    sin_port = other.sin_port;
-    sin_addr = other.sin_addr;
-    std::memset(x_sin_zero, 0, sizeof(x_sin_zero));
-
-    return *this;
-  }
-
-  uint16_t sin_family;
-  rex::be<uint16_t> sin_port;
-  rex::be<uint32_t> sin_addr;
-  // sin_zero is defined as __pad on Android, so prefixed here.
-  char x_sin_zero[8];
+struct XWSABUF {
+  rex::be<uint32_t> len;
+  rex::be<uint32_t> buf_ptr;
 };
+static_assert(sizeof(XWSABUF) == 0x8, "XWSABUF size");
+
+struct XWSAOVERLAPPED {
+  rex::be<uint32_t> internal;       // status
+  rex::be<uint32_t> internal_high;  // bytes transferred
+  rex::be<uint32_t> offset;         // flags
+  rex::be<uint32_t> offset_high;
+  rex::be<uint32_t> event_handle;
+};
+static_assert(sizeof(XWSAOVERLAPPED) == 0x14, "XWSAOVERLAPPED size");
 
 class XSocket : public XObject {
  public:
@@ -85,8 +126,9 @@ class XSocket : public XObject {
     X_IPPROTO_UDP = 17,
 
     // LIVE Voice and Data Protocol
-    // https://blog.csdn.net/baozi3026/article/details/4277227
     // Format: [cbGameData][GameData(encrypted)][VoiceData(unencrypted)]
+    // Every peer here is another ReXGlue instance, so VDP is carried as plain
+    // UDP with the payload passed through unchanged.
     X_IPPROTO_VDP = 254,
   };
 
@@ -95,55 +137,95 @@ class XSocket : public XObject {
 
   uint64_t native_handle() const { return native_handle_; }
   uint16_t bound_port() const { return bound_port_; }
+  bool is_vdp() const { return vdp_; }
+  bool is_tcp() const { return proto_ == X_IPPROTO_TCP; }
 
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
-  X_STATUS Close();
+  int Close();
 
-  X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
-  X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
+  int GetOption(uint32_t level, uint32_t optname, uint8_t* optval_ptr, uint32_t* optlen);
+  int SetOption(uint32_t level, uint32_t optname, const uint8_t* optval_ptr, uint32_t optlen);
+  int IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
-  X_STATUS Connect(N_XSOCKADDR* name, int name_len);
-  X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
-  X_STATUS Listen(int backlog);
-  object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
+  int Connect(const XSOCKADDR_IN* name, int name_len);
+  int Bind(const XSOCKADDR_IN* name, int name_len);
+  int Listen(int backlog);
+  object_ref<XSocket> Accept(XSOCKADDR_IN* name, uint32_t* name_len);
   int Shutdown(int how);
+  int GetPeerName(XSOCKADDR_IN* name, uint32_t* name_len);
+  int GetSockName(XSOCKADDR_IN* name, uint32_t* name_len);
 
   int Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags);
   int Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags);
-
-  int RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
+  int RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, XSOCKADDR_IN* from,
                uint32_t* from_len);
-  int SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to, uint32_t to_len);
+  int SendTo(const uint8_t* buf, uint32_t buf_len, uint32_t flags, const XSOCKADDR_IN* to,
+             uint32_t to_len);
 
-  struct packet {
-    // These values are in network byte order.
-    rex::be<uint16_t> src_port;
-    rex::be<uint32_t> src_ip;
+  int WSASendTo(const XWSABUF* buffers, uint32_t num_buffers, rex::be<uint32_t>* num_bytes_sent,
+                uint32_t flags, const XSOCKADDR_IN* to, uint32_t to_len,
+                XWSAOVERLAPPED* overlapped);
+  int WSARecvFrom(const XWSABUF* buffers, uint32_t num_buffers,
+                  rex::be<uint32_t>* num_bytes_recv, rex::be<uint32_t>* flags_ptr,
+                  XSOCKADDR_IN* from, rex::be<uint32_t>* from_len, XWSAOVERLAPPED* overlapped);
+  bool WSAGetOverlappedResult(XWSAOVERLAPPED* overlapped, rex::be<uint32_t>* bytes_transferred,
+                              bool wait, rex::be<uint32_t>* flags_ptr);
+  int WSACancelOverlappedIO();
 
-    uint16_t data_len;
-    uint8_t data[1];
-  };
-
-  // Queue a packet into our internal buffer.
-  bool QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len);
+  // Last host socket error, translated to the guest's WSA error space.
+  static uint32_t LastError();
+  static void SetLastError(X_WSA_ERROR error);
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
-  uint64_t native_handle_ = -1;
 
-  AddressFamily af_;    // Address family
-  Type type_;           // Type (DGRAM/Stream/etc)
-  Protocol proto_;      // Protocol (TCP/UDP/etc)
-  bool secure_ = true;  // Secure socket (encryption enabled)
+  struct SendRequest {
+    std::vector<XWSABUF> buffers;
+    bool has_to = false;
+    XSOCKADDR_IN to = {};
+    uint32_t to_len = 0;
+    XWSAOVERLAPPED* overlapped = nullptr;
+  };
 
-  bool bound_ = false;  // Explicitly bound to an IP address?
-  uint16_t bound_port_ = 0;
+  struct RecvRequest {
+    XWSABUF buffer = {};
+    rex::be<uint32_t>* num_bytes_recv = nullptr;
+    rex::be<uint32_t>* flags = nullptr;
+    XSOCKADDR_IN* from = nullptr;
+    rex::be<uint32_t>* from_len = nullptr;
+    XWSAOVERLAPPED* overlapped = nullptr;
+  };
 
-  bool broadcast_socket_ = false;
+  // >0 ready, 0 not ready, <0 error/cancelled.
+  int SelectReady(bool for_write, bool wait);
+  int DoSend(const SendRequest& request, bool wait, uint32_t* bytes_sent);
+  int DoRecv(const RecvRequest& request, bool wait);
+  void CompleteOverlapped(XWSAOVERLAPPED* overlapped, uint32_t status, uint32_t bytes,
+                          uint32_t flags);
+  void NoteImplicitBind();
 
-  std::unique_ptr<rex::thread::Event> event_;
-  std::mutex incoming_packet_mutex_;
-  std::queue<uint8_t*> incoming_packets_;
+  // Rewrites a guest destination for the host network: limited broadcast is
+  // sent to the selected adapter's directed broadcast, loopback to self.
+  void TranslateDestination(const XSOCKADDR_IN& guest, void* host_sockaddr_in) const;
+
+  uint64_t native_handle_ = ~0ull;
+  bool closed_ = false;
+
+  AddressFamily af_ = X_AF_INET;
+  Type type_ = X_SOCK_DGRAM;
+  Protocol proto_ = X_IPPROTO_UDP;
+  bool vdp_ = false;
+  bool secure_ = true;
+  bool broadcast_ = false;
+  bool non_blocking_ = false;
+
+  uint16_t bound_port_ = 0;  // host byte order
+
+  std::mutex send_mutex_;
+  std::mutex recv_mutex_;
+  std::map<XWSAOVERLAPPED*, std::future<int>> send_tasks_;
+  std::map<XWSAOVERLAPPED*, std::future<int>> recv_tasks_;
+  std::atomic<bool> cancel_ = false;
 };
 
 }  // namespace rex::system

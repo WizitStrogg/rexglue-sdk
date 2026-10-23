@@ -16,6 +16,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/systemlink.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/hook.h>
@@ -29,6 +30,7 @@
 #include <rex/system/xtypes.h>
 
 #include "xam_diag.h"
+#include "xam_session.h"
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
@@ -37,6 +39,21 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+
+// XUID the guest sees. Content stays keyed on user_profile()->xuid() so
+// saves are found no matter which network identity is configured.
+uint64_t guest_xuid() {
+  return systemlink::network_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+}
+
+std::string guest_name() {
+  const std::string& name = systemlink::gamertag_override();
+  return name.empty() ? REX_KERNEL_STATE()->user_profile()->name() : name.substr(0, 15);
+}
+
+}  // namespace
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -52,11 +69,11 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
         // maybe online profile?
-        xuid = user_profile->xuid();
+        xuid = guest_xuid();
         result = X_E_SUCCESS;
       } else if (type & 1) {
         // maybe offline profile?
-        xuid = user_profile->xuid();
+        xuid = guest_xuid();
         result = X_E_SUCCESS;
       }
     }
@@ -118,9 +135,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = user_profile->xuid();
+  info->xuid = guest_xuid();
   info->signin_state = user_profile->signin_state();
-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  rex::string::copy_truncating(info->name, guest_name(), rex::countof(info->name));
   if (diag::enabled()) {
     char m[96];
     std::snprintf(m, sizeof(m), "XamUserGetSigninInfo user=%u flags=0x%X -> X_E_SUCCESS",
@@ -145,8 +162,7 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
+  const auto user_name = guest_name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -164,8 +180,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  auto user_name = rex::string::to_utf16(guest_name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -297,7 +312,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
     out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
     if (xuids) {
-      out_setting->xuid = user_profile->xuid();
+      out_setting->xuid = guest_xuid();
     } else {
       out_setting->user_index = static_cast<uint32_t>(user_index);
     }
@@ -437,12 +452,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // Offline: deny everything so games don't try to do stuff. System Link:
+  // grant multiplayer (XPRIVILEGE_MULTIPLAYER_SESSIONS = 254) and the
+  // rest, otherwise titles hide their LAN options.
+  *out_value = systemlink::enabled() ? 1 : 0;
   if (diag::enabled()) {
     char m[96];
-    std::snprintf(m, sizeof(m), "XamUserCheckPrivilege user=%u mask=0x%X -> SUCCESS value=0",
-                  (unsigned)user_index, (unsigned)mask);
+    std::snprintf(m, sizeof(m), "XamUserCheckPrivilege user=%u mask=0x%X -> SUCCESS value=%u",
+                  (unsigned)user_index, (unsigned)mask, (unsigned)*out_value);
     diag::trace(m);
   }
   return X_ERROR_SUCCESS;
@@ -780,15 +797,12 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
 }
 
 u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  *handle_ptr = session::CreateHandle();
   return X_ERROR_SUCCESS;
 }
 
 u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  *obj_ptr = session::ObjectForHandle(handle);
   return X_ERROR_SUCCESS;
 }
 
