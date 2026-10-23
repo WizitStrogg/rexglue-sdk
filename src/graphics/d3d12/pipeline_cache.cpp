@@ -66,7 +66,7 @@ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
 REXCVAR_DEFINE_STRING(depth_bias_shader, "", "GPU/D3D12",
-                      "Guest pixel shader ucode hash (hex) whose draws get "
+                      "Guest pixel shader ucode hashes (hex, comma-separated) whose draws get "
                       "depth_bias_shader_units of extra host depth bias, for geometry that "
                       "relies on exact ties in the guest's 24-bit float depth (Z fighting on "
                       "the host's 32-bit depth). Host render target path only.")
@@ -76,6 +76,44 @@ REXCVAR_DEFINE_INT32(depth_bias_shader_units, 0, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
+
+namespace {
+
+// Whether a guest pixel shader is in the depth_bias_shader list. The parsed
+// list is cached until the cvar string changes.
+bool IsDepthBiasShader(uint64_t ucode_data_hash) {
+  static std::mutex mutex;
+  static std::string parsed_spec;
+  static std::vector<uint64_t> hashes;
+  const std::string& spec = REXCVAR_GET(depth_bias_shader);
+  if (spec.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  if (spec != parsed_spec) {
+    parsed_spec = spec;
+    hashes.clear();
+    size_t start = 0;
+    while (start < spec.size()) {
+      size_t end = spec.find_first_of(",; ", start);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      if (end > start) {
+        std::string token = spec.substr(start, end - start);
+        char* token_end = nullptr;
+        uint64_t hash = std::strtoull(token.c_str(), &token_end, 16);
+        if (token_end != token.c_str()) {
+          hashes.push_back(hash);
+        }
+      }
+      start = end + 1;
+    }
+  }
+  return std::find(hashes.begin(), hashes.end(), ucode_data_hash) != hashes.end();
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1437,10 +1475,7 @@ bool PipelineCache::GetCurrentStateDescription(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
-    const std::string& bias_shader = REXCVAR_GET(depth_bias_shader);
-    if (pixel_shader && !bias_shader.empty() &&
-        std::strtoull(bias_shader.c_str(), nullptr, 16) ==
-            pixel_shader->shader().ucode_data_hash()) {
+    if (pixel_shader && IsDepthBiasShader(pixel_shader->shader().ucode_data_hash())) {
       description_out.depth_bias += REXCVAR_GET(depth_bias_shader_units);
     }
   }
