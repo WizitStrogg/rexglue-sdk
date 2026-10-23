@@ -472,4 +472,14 @@ std::vector<HostedSession> HostedSessions() {
   return out;
 }
 
+uint32_t JoinedHostIp() {
+  std::lock_guard lock(mutex);
+  for (const auto& [obj, s] : sessions) {
+    if (s.created && !s.host && s.state != SessionState::kDeleted && (s.flags & kPeerNetwork)) {
+      return systemlink::ip_from_xnaddr(s.info.hostAddress);
+    }
+  }
+  return 0;
+}
+
 }  // namespace rex::kernel::xam::session

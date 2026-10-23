@@ -32,6 +32,7 @@ struct LobbyStatus {
   bool networking_enabled = false;  // network_mode = systemlink
   bool running = false;             // lobby socket is open
   bool in_world = false;            // we are hosting a session
+  uint32_t joined_host_ip = 0;      // in someone else's game: their address (else 0)
   uint16_t port = 0;
   std::string game_address;         // address the game uses (XNADDR)
   std::vector<std::string> adapters;  // "name ip/broadcast", announced on

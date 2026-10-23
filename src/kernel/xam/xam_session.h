@@ -52,4 +52,8 @@ struct HostedSession {
 };
 std::vector<HostedSession> HostedSessions();
 
+// Address (host byte order) of the host of a peer session this machine joined
+// as a client, or 0 if it is not in someone else's session.
+uint32_t JoinedHostIp();
+
 }  // namespace rex::kernel::xam::session

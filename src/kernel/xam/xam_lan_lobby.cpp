@@ -1133,6 +1133,7 @@ LobbyStatus GetLobbyStatus() {
   status.networking_enabled = systemlink::enabled();
   status.running = lobby_socket.load() != ~0ull;
   status.in_world = !session::HostedSessions().empty();
+  status.joined_host_ip = session::JoinedHostIp();
   status.port = uint16_t(REXCVAR_GET(lan_lobby_port));
   if (status.networking_enabled) {
     status.game_address = systemlink::ip_to_string(systemlink::local_ip());
