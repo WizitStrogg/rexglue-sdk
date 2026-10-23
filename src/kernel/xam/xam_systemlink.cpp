@@ -40,10 +40,10 @@ REXCVAR_DEFINE_STRING(network_interface, "",
                       "IPv4 address of the host adapter used for System Link (e.g. a ZeroTier "
                       "or Hamachi address). Empty = pick the first private LAN adapter");
 REXCVAR_DEFINE_STRING(profile_xuid, "", "Network",
-                      "XUID the game sees for the signed-in profile. Empty = the built-in "
-                      "default, 'auto' = derived from this PC's name, or a 16-digit hex value. "
-                      "Every PC in a System Link game needs a different XUID. Saves stay in "
-                      "the default profile folder either way");
+                      "Player identity. Empty or 'auto' = keep the built-in offline XUID (which "
+                      "owns the saves) and, with networking on, derive a per-PC online XUID "
+                      "from this PC's name. A 16-digit hex value replaces both, so existing "
+                      "saves will not load");
 REXCVAR_DEFINE_STRING(profile_gamertag, "", "Network",
                       "Gamertag shown to other players. Empty = built-in default");
 
@@ -329,8 +329,9 @@ uint64_t network_xuid(uint64_t legacy_xuid) {
     }
     uint64_t result = 0;
     if (value == "auto") {
-      // Offline XUID range (0xE000...), stable per PC name.
-      result = 0xE000000000000000ull | (fnv1a64(host_name()) & 0x0000FFFFFFFFFFFFull);
+      // 'auto' only changes the online XUID (online_xuid); saves are owned by
+      // the offline XUID, which stays the default.
+      return legacy_xuid;
     } else {
       try {
         result = std::stoull(value, nullptr, 16);
@@ -342,6 +343,27 @@ uint64_t network_xuid(uint64_t legacy_xuid) {
     // 58410A1F-style titles reject XUIDs with bits 54-55 set.
     result &= ~(3ull << 54);
     REXKRNL_INFO("SystemLink: profile XUID {:016X}", result);
+    return result;
+  }();
+  return xuid;
+}
+
+uint64_t online_xuid(uint64_t legacy_xuid) {
+  if (!enabled()) {
+    return network_xuid(legacy_xuid);
+  }
+  static const uint64_t xuid = [legacy_xuid] {
+    const std::string& value = REXCVAR_GET(profile_xuid);
+    uint64_t result = 0;
+    if (!value.empty() && value != "auto") {
+      result = network_xuid(legacy_xuid);  // explicit hex XUID wins
+    } else {
+      // Online XUID range (0x0009...), stable per PC name, so every PC in a
+      // game is a different player without touching the save's owner.
+      result = 0x0009000000000000ull | (fnv1a64(host_name() + "/online") & 0x0000FFFFFFFFFFFFull);
+    }
+    REXKRNL_INFO("SystemLink: online XUID {:016X} (saves stay with {:016X})", result,
+                 network_xuid(legacy_xuid));
     return result;
   }();
   return xuid;

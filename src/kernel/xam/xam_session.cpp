@@ -161,7 +161,7 @@ T* guest(uint32_t address) {
 }
 
 uint64_t local_xuid() {
-  return systemlink::network_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+  return systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
 }
 
 uint64_t xnkid_value(const XNKID& kid) {

@@ -54,6 +54,10 @@ uint32_t guest_signin_state(uint32_t profile_state) {
   return (systemlink::enabled() && profile_state != 0) ? 2u : profile_state;
 }
 
+uint64_t guest_online_xuid() {
+  return systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+}
+
 std::string guest_name() {
   const std::string& name = systemlink::gamertag_override();
   return name.empty() ? REX_KERNEL_STATE()->user_profile()->name() : name.substr(0, 15);
@@ -74,8 +78,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
-        // maybe online profile?
-        xuid = guest_xuid();
+        // Online XUID: what other players see.
+        xuid = guest_online_xuid();
         result = X_E_SUCCESS;
       } else if (type & 1) {
         // maybe offline profile?
@@ -141,7 +145,10 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = guest_xuid();
+  // flags: 1 = online XUID only, 2 = offline XUID only, 0 = online when
+  // signed in to LIVE.
+  const bool live = guest_signin_state(user_profile->signin_state()) == 2;
+  info->xuid = (flags & 2) ? guest_xuid() : ((flags & 1) || live) ? guest_online_xuid() : guest_xuid();
   info->signin_state = guest_signin_state(user_profile->signin_state());
   if (info->signin_state == 2) {
     info->unk08 = 1;  // XUSER_INFO_FLAG_LIVE_ENABLED
@@ -214,7 +221,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
     assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid() ||
-                static_cast<uint64_t>(xuids[0]) == guest_xuid());
+                static_cast<uint64_t>(xuids[0]) == guest_xuid() ||
+                static_cast<uint64_t>(xuids[0]) == guest_online_xuid());
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;

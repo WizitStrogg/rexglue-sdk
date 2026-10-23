@@ -97,6 +97,10 @@ void set_registered_session_id(uint64_t id);
 
 // XUID the guest sees through XamUser* APIs (cvar profile_xuid).
 uint64_t network_xuid(uint64_t legacy_xuid);
+// XUID other players see (online XUID, XSession members, LAN lobby). With
+// networking on it is derived from this PC's name unless profile_xuid is an
+// explicit hex value; the offline XUID (network_xuid) keeps owning the saves.
+uint64_t online_xuid(uint64_t legacy_xuid);
 // Gamertag override (cvar profile_gamertag), empty if unset.
 const std::string& gamertag_override();
 
