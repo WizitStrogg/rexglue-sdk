@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -172,6 +173,26 @@ class CommandProcessor {
   // CPU may read after it can be made visible first.
   virtual void OnBeforeGuestVisibleWrite() {}
 
+  // Asynchronous guest-visible writes: instead of waiting for the GPU before a
+  // fence write or an interrupt that the CPU may follow by reading GPU results,
+  // the backend can schedule those results to be copied back and return a
+  // token, and the write itself is queued and done once the token completes,
+  // in order, while the command processor keeps going.
+  // Returns 0 when the write can be done immediately.
+  virtual uint64_t PrepareAsyncGuestVisibleWrite() { return 0; }
+  // Whether the GPU work for the token has completed, waiting for it if
+  // `wait` is true.
+  virtual bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) { return true; }
+  void QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write);
+  // Does the queued writes whose GPU work has completed (or all, waiting for
+  // the GPU, if `wait` is true).
+  void FlushAsyncGuestVisibleWrites(bool wait);
+  bool HasAsyncGuestVisibleWrites() const { return !async_guest_writes_.empty(); }
+  // Executes a fence write or an interrupt packet asynchronously if needed.
+  // Returns false if the packet must be executed normally instead.
+  bool TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode, uint32_t count,
+                                  bool* result);
+
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
@@ -256,6 +277,13 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  struct AsyncGuestVisibleWrite {
+    uint64_t token;
+    std::function<void()> write;
+  };
+  std::deque<AsyncGuestVisibleWrite> async_guest_writes_;
+  uint32_t async_guest_writes_poll_counter_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

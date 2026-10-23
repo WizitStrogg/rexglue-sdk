@@ -724,7 +724,81 @@ void CommandProcessor::MakeCoherent() {
   regs_volatile[XE_GPU_REG_COHER_STATUS_HOST] = 0;
 }
 
-void CommandProcessor::PrepareForWait() {}
+void CommandProcessor::PrepareForWait() { FlushAsyncGuestVisibleWrites(true); }
+
+void CommandProcessor::QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write) {
+  if (!async_guest_writes_.empty()) {
+    // Keep the writes in order.
+    token = std::max(token, async_guest_writes_.back().token);
+  }
+  async_guest_writes_.push_back({token, std::move(write)});
+}
+
+void CommandProcessor::FlushAsyncGuestVisibleWrites(bool wait) {
+  while (!async_guest_writes_.empty()) {
+    AsyncGuestVisibleWrite& front = async_guest_writes_.front();
+    if (!IsAsyncGuestVisibleWriteReady(front.token, wait)) {
+      break;
+    }
+    std::function<void()> write = std::move(front.write);
+    async_guest_writes_.pop_front();
+    write();
+  }
+}
+
+bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode,
+                                                  uint32_t count, bool* result) {
+  uint64_t token = PrepareAsyncGuestVisibleWrite();
+  if (!token && async_guest_writes_.empty()) {
+    return false;
+  }
+  *result = true;
+  switch (opcode) {
+    case PM4_INTERRUPT: {
+      uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+      QueueAsyncGuestVisibleWrite(token, [this, cpu_mask]() {
+        for (int n = 0; n < 6; n++) {
+          if ((cpu_mask & (1 << n)) && graphics_system_) {
+            graphics_system_->DispatchInterruptCallback(1, n);
+          }
+        }
+      });
+    } break;
+    case PM4_MEM_WRITE: {
+      uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
+      std::vector<uint32_t> write_data(count ? count - 1 : 0);
+      for (uint32_t& data : write_data) {
+        data = reader->ReadAndSwap<uint32_t>();
+      }
+      QueueAsyncGuestVisibleWrite(token, [this, write_addr, write_data = std::move(write_data)]() {
+        uint32_t addr = write_addr;
+        for (uint32_t data : write_data) {
+          auto endianness = static_cast<xenos::Endian>(addr & 0x3);
+          memory::store(memory_->TranslatePhysical(addr & ~uint32_t(0x3)),
+                        GpuSwap(data, endianness));
+          addr += 4;
+        }
+      });
+    } break;
+    case PM4_EVENT_WRITE_SHD: {
+      uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+      uint32_t address = reader->ReadAndSwap<uint32_t>();
+      uint32_t value = reader->ReadAndSwap<uint32_t>();
+      WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+      uint32_t data_value = ((initiator >> 31) & 0x1) ? counter_ : value;
+      QueueAsyncGuestVisibleWrite(token, [this, address, data_value]() {
+        auto endianness = static_cast<xenos::Endian>(address & 0x3);
+        memory::store(memory_->TranslatePhysical(address & ~uint32_t(0x3)),
+                      GpuSwap(data_value, endianness));
+      });
+    } break;
+    default:
+      assert_unhandled_case(opcode);
+      *result = false;
+      break;
+  }
+  return true;
+}
 
 void CommandProcessor::ReturnFromWait() {}
 
@@ -868,15 +942,29 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  if (!async_guest_writes_.empty() && !(++async_guest_writes_poll_counter_ & 15)) {
+    FlushAsyncGuestVisibleWrites(false);
+  }
   switch (opcode) {
     case PM4_INTERRUPT:
-    case PM4_XE_SWAP:
-    case PM4_REG_TO_MEM:
     case PM4_MEM_WRITE:
+    case PM4_EVENT_WRITE_SHD: {
+      bool async_result;
+      if (TryExecutePacketType3Async(reader, opcode, count, &async_result)) {
+        return async_result;
+      }
+      FlushAsyncGuestVisibleWrites(true);
+      OnBeforeGuestVisibleWrite();
+    } break;
+    case PM4_XE_SWAP:
+      // Presenting doesn't make GPU results visible to the guest CPU.
+      FlushAsyncGuestVisibleWrites(false);
+      break;
+    case PM4_REG_TO_MEM:
     case PM4_COND_WRITE:
-    case PM4_EVENT_WRITE_SHD:
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
+      FlushAsyncGuestVisibleWrites(true);
       OnBeforeGuestVisibleWrite();
       break;
     default:
@@ -1202,6 +1290,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           return false;
         }
       } else {
+        // The value may be written by a queued asynchronous write.
+        FlushAsyncGuestVisibleWrites(true);
         rex::thread::MaybeYield();
       }
     }
