@@ -102,6 +102,7 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
       rex::cvar::SetFlagByName(cvar, value ? "true" : "false");
     }
   };
+  option_checkbox("coop_lua_runner", "Run co-op scripts (untick if the game misbehaves)");
   option_checkbox("coop_own_hero", "Partners appear as their own hero (experimental)");
   option_checkbox("coop_own_camera", "My camera follows only my hero (experimental)");
   option_checkbox("coop_camera_follow_partner",
