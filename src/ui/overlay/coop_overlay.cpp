@@ -103,6 +103,8 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
     }
   };
   option_checkbox("coop_lua_runner", "Run co-op scripts (untick if the game misbehaves)");
+  option_checkbox("coop_own_hero",
+                  "Partners appear as their own hero (both PCs; the host dresses the partner)");
   option_checkbox("coop_own_camera",
                   "In someone else's game, my camera follows my own hero (mouse/right stick turns it)");
   auto option_metres = [](const char* cvar, const char* label, int max_m) {
