@@ -408,15 +408,24 @@ void run() {
           send_to(s, beacon, peer, port);
         }
       }
-      std::lock_guard lock(mutex);
-      for (auto it = remotes.begin(); it != remotes.end();) {
-        if (now - it->second.last_seen > kExpiry) {
-          REXKRNL_INFO("LAN lobby: session {:016X} from {} expired", it->first,
-                       systemlink::ip_to_string(it->second.host_ip));
-          it = remotes.erase(it);
-        } else {
-          ++it;
+      bool removed = false;
+      {
+        std::lock_guard lock(mutex);
+        for (auto it = remotes.begin(); it != remotes.end();) {
+          if (now - it->second.last_seen > kExpiry) {
+            REXKRNL_INFO("LAN lobby: session {:016X} from {} expired", it->first,
+                         systemlink::ip_to_string(it->second.host_ip));
+            it = remotes.erase(it);
+            removed = true;
+          } else {
+            ++it;
+          }
         }
+      }
+      if (removed) {
+        // XN_FRIENDS_FRIEND_REMOVED / PRESENCE_CHANGED for user 0.
+        REX_KERNEL_STATE()->BroadcastNotification(0x04000003, 0);
+        REX_KERNEL_STATE()->BroadcastNotification(0x04000001, 0);
       }
     }
 
@@ -453,13 +462,23 @@ void run() {
     systemlink::xnaddr_from_ip(from_ip, &advert.info.hostAddress);
     advert.last_seen = std::chrono::steady_clock::now();
     const uint64_t id = session_id(advert.info);
-    std::lock_guard lock(mutex);
-    if (!remotes.count(id)) {
-      REXKRNL_INFO("LAN lobby: found session {:016X} hosted by '{}' at {} ({}+{} of {}+{} slots)",
-                   id, advert.gamertag, systemlink::ip_to_string(from_ip), advert.used_public,
-                   advert.used_private, advert.max_public, advert.max_private);
+    bool added = false;
+    {
+      std::lock_guard lock(mutex);
+      if (!remotes.count(id)) {
+        REXKRNL_INFO("LAN lobby: found session {:016X} hosted by '{}' at {} ({}+{} of {}+{} slots)",
+                     id, advert.gamertag, systemlink::ip_to_string(from_ip), advert.used_public,
+                     advert.used_private, advert.max_public, advert.max_private);
+        added = true;
+      }
+      remotes[id] = std::move(advert);
     }
-    remotes[id] = std::move(advert);
+    if (added) {
+      // XN_FRIENDS_FRIEND_ADDED / PRESENCE_CHANGED so the title re-reads the
+      // friends list (and draws the orb).
+      REX_KERNEL_STATE()->BroadcastNotification(0x04000002, 0);
+      REX_KERNEL_STATE()->BroadcastNotification(0x04000001, 0);
+    }
   }
 }
 
