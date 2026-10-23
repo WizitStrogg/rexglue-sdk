@@ -945,15 +945,37 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   if (!async_guest_writes_.empty() && !(++async_guest_writes_poll_counter_ & 15)) {
     FlushAsyncGuestVisibleWrites(false);
   }
+  // Diagnostic: per-5-second counts of guest-visible packets and how they were
+  // handled (asynchronously queued, or synchronously after waiting).
+  static uint64_t diag_async = 0, diag_sync = 0, diag_drain = 0;
+  static auto diag_last_log = std::chrono::steady_clock::now();
+  switch (opcode) {
+    case PM4_INTERRUPT:
+    case PM4_MEM_WRITE:
+    case PM4_EVENT_WRITE_SHD:
+    case PM4_REG_TO_MEM:
+    case PM4_COND_WRITE: {
+      const auto now_log = std::chrono::steady_clock::now();
+      if (now_log - diag_last_log >= std::chrono::seconds(5)) {
+        REXGPU_INFO("Guest-visible writes in 5 s: {} async, {} immediate, {} after GPU wait",
+                    diag_async, diag_sync, diag_drain);
+        diag_async = diag_sync = diag_drain = 0;
+        diag_last_log = now_log;
+      }
+    } break;
+    default:
+      break;
+  }
   switch (opcode) {
     case PM4_INTERRUPT:
     case PM4_MEM_WRITE:
     case PM4_EVENT_WRITE_SHD: {
       bool async_result;
       if (TryExecutePacketType3Async(reader, opcode, count, &async_result)) {
+        ++diag_async;
         return async_result;
       }
-      FlushAsyncGuestVisibleWrites(true);
+      ++diag_sync;
       OnBeforeGuestVisibleWrite();
     } break;
     case PM4_XE_SWAP:
@@ -962,10 +984,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_REG_TO_MEM:
     case PM4_COND_WRITE:
-    case PM4_EVENT_WRITE_EXT:
-    case PM4_EVENT_WRITE_ZPD:
+      if (!async_guest_writes_.empty()) {
+        ++diag_drain;
+      }
       FlushAsyncGuestVisibleWrites(true);
       OnBeforeGuestVisibleWrite();
+      break;
+    case PM4_EVENT_WRITE_EXT:
+    case PM4_EVENT_WRITE_ZPD:
+      // Screen extents are faked, and occlusion query results don't depend on
+      // memexport or on fence ordering, so neither needs to wait for the GPU.
       break;
     default:
       break;

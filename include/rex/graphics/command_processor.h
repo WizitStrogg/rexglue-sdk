@@ -182,7 +182,9 @@ class CommandProcessor {
   virtual uint64_t PrepareAsyncGuestVisibleWrite() { return 0; }
   // Whether the GPU work for the token has completed, waiting for it if
   // `wait` is true.
-  virtual bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) { return true; }
+  virtual bool IsAsyncGuestVisibleWriteReady(uint64_t /* token */, bool /* wait */) {
+    return true;
+  }
   void QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write);
   // Does the queued writes whose GPU work has completed (or all, waiting for
   // the GPU, if `wait` is true).
