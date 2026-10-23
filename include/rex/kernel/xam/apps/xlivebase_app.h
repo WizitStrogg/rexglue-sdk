@@ -24,6 +24,9 @@ class XLiveBaseApp : public system::xam::App {
 
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
+
+ private:
+  void LogUnimplemented(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length);
 };
 
 }  // namespace apps
