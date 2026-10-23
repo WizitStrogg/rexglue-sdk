@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/systemlink.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -35,6 +36,15 @@ uint32_t xeXamNotifyCreateListener(uint64_t mask, uint32_t is_system, uint32_t m
 
   // Handle ref is incremented, so return that.
   uint32_t handle = listener->handle();
+
+  // Titles wait for XN_LIVE_CONNECTIONCHANGED before using LIVE features.
+  // Report the logon once to the first listener that watches the LIVE area.
+  static bool notified_live_logon = false;
+  if (systemlink::enabled() && (mask & 0x2) && !notified_live_logon) {
+    notified_live_logon = true;
+    listener->EnqueueNotification(0x02000001, 0x001510F0);  // CONNECTION_ESTABLISHED
+    REXKRNL_INFO("XamNotifyCreateListener: reporting Xbox LIVE logon to listener {:08X}", handle);
+  }
 
   REXKRNL_DEBUG(
       "XamNotifyCreateListener(mask={:#018x}, is_system={}, max_version={}) -> handle={:08X}", mask,

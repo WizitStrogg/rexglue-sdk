@@ -48,6 +48,12 @@ uint64_t guest_xuid() {
   return systemlink::network_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
 }
 
+// With networking on, the profile reports as signed in to Xbox LIVE: titles
+// whose co-op is LIVE-only (Fable II) hide it entirely for local sign-ins.
+uint32_t guest_signin_state(uint32_t profile_state) {
+  return (systemlink::enabled() && profile_state != 0) ? 2u : profile_state;
+}
+
 std::string guest_name() {
   const std::string& name = systemlink::gamertag_override();
   return name.empty() ? REX_KERNEL_STATE()->user_profile()->name() : name.substr(0, 15);
@@ -96,7 +102,7 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
   if (user_index < 4) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+      signin_state = guest_signin_state(user_profile->signin_state());
     }
   }
   if (diag::enabled()) {
@@ -136,7 +142,10 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = guest_xuid();
-  info->signin_state = user_profile->signin_state();
+  info->signin_state = guest_signin_state(user_profile->signin_state());
+  if (info->signin_state == 2) {
+    info->unk08 = 1;  // XUSER_INFO_FLAG_LIVE_ENABLED
+  }
   rex::string::copy_truncating(info->name, guest_name(), rex::countof(info->name));
   if (diag::enabled()) {
     char m[96];
