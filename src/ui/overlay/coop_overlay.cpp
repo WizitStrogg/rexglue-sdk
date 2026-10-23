@@ -10,6 +10,8 @@
 #include <rex/cvar.h>
 #include <rex/kernel/xam/lan_lobby.h>
 #include <imgui.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -92,12 +94,31 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
 
   // Game-specific co-op options, shown when the game defines them (the
   // overlay only knows them by name).
-  if (!rex::cvar::GetFlagByName("coop_own_hero").empty()) {
-    bool own_hero = rex::cvar::Query<bool>("coop_own_hero");
+  auto option_checkbox = [](const char* cvar, const char* label) {
+    if (rex::cvar::GetFlagByName(cvar).empty()) return;
+    bool value = rex::cvar::Query<bool>(cvar);
     ImGui::SetCursorPosX(110.0f);
-    if (ImGui::Checkbox("Partners appear as their own hero (experimental)", &own_hero)) {
-      rex::cvar::SetFlagByName("coop_own_hero", own_hero ? "true" : "false");
+    if (ImGui::Checkbox(label, &value)) {
+      rex::cvar::SetFlagByName(cvar, value ? "true" : "false");
     }
+  };
+  option_checkbox("coop_own_hero", "Partners appear as their own hero (experimental)");
+  option_checkbox("coop_own_camera", "My camera follows only my hero (experimental)");
+  option_checkbox("coop_camera_follow_partner",
+                  "In someone else's game, aim my camera at my own character");
+  auto option_metres = [](const char* cvar, const char* label, int max_m) {
+    if (rex::cvar::GetFlagByName(cvar).empty()) return;
+    int value = rex::cvar::Query<int32_t>(cvar);
+    ImGui::SetCursorPosX(110.0f);
+    ImGui::SetNextItemWidth(90.0f);
+    if (ImGui::InputInt(label, &value, 1, 5)) {
+      value = std::clamp(value, 0, max_m);
+      rex::cvar::SetFlagByName(cvar, std::to_string(value));
+    }
+  };
+  if (!rex::cvar::GetFlagByName("coop_leash_outdoor_m").empty()) {
+    option_metres("coop_leash_outdoor_m", "m apart outdoors (host, 0 = game default)", 50);
+    option_metres("coop_leash_indoor_m", "m apart indoors (host, 0 = game default)", 20);
   }
   const std::string story_sync = rex::cvar::GetFlagByName("coop_story_sync");
   if (!story_sync.empty()) {
