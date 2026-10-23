@@ -13,6 +13,7 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include "../xam_lan_lobby.h"
 #include "../xam_session.h"
 
 namespace rex {
@@ -44,6 +45,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
+      if (user_index == 0) {
+        lobby::SetContext(context_id, context_value);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -53,6 +57,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                     value_size, value_ptr);
+      if ((user_index == 0 || user_index == 0xFFFFFFFF) && value_ptr) {
+        lobby::SetProperty(property_id, memory_->TranslateVirtual<uint8_t*>(value_ptr), value_size);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
@@ -121,21 +128,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B0016: {
       assert_true(!buffer_length || buffer_length == 32);
-
-      uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
-      uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
-      uint32_t props_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
-
-      REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
-                    user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
-                    results_buffer_size, search_results_ptr);
-      return X_E_SUCCESS;
+      return lobby::Search(buffer, buffer_length);
     }
     case 0x000B0018: {
       assert_true(!buffer_length || buffer_length == 16);
@@ -143,25 +136,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     }
     case 0x000B001C: {
       assert_true(!buffer_length || buffer_length == 36);
-
-      // session_search
-      uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
-      uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
-      uint32_t props_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
-      //
-      uint32_t num_users = memory::load_and_swap<uint32_t>(buffer + 32);
-
-      REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
-                    proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
-                    results_buffer_size, search_results_ptr, num_users);
-
-      return X_E_SUCCESS;
+      // XSessionSearchEx: XSessionSearch's struct plus a user count.
+      return lobby::Search(buffer, buffer_length);
     }
     case 0x000B001D: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -199,22 +175,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001B: {
-      assert_true(!buffer_length || buffer_length == 32);
-
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_ids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
-
-      REXKRNL_DEBUG("XSessionSearchByID({}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
-
-      return X_E_SUCCESS;
+      // XSessionSearchByID is 0x14 bytes; some titles send the by-ids layout.
+      if (buffer_length == 0x14) {
+        return lobby::SearchById(buffer, buffer_length);
+      }
+      return lobby::SearchByIds(buffer, buffer_length);
+    }
+    case 0x000B0060: {
+      return lobby::SearchByIds(buffer, buffer_length);
     }
     case 0x000B001F: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -318,24 +286,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         memory::store_and_swap<uint32_t>(context + 4, value);
       }
       return X_E_FAIL;
-    }
-    case 0x000B0060: {
-      assert_true(!buffer_length || buffer_length == 32);
-
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_ids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
-
-      REXKRNL_DEBUG("XSessionSearchByIds({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
-
-      return X_E_SUCCESS;
     }
     case 0x000B0065: {
       assert_true(!buffer_length || buffer_length == 52);

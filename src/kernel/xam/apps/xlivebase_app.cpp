@@ -13,6 +13,11 @@
 #include <rex/logging.h>
 #include <rex/thread.h>
 
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <string>
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -24,6 +29,58 @@ using namespace rex::system;
 XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state) : App(kernel_state, 0xFC) {}
 
 // http://mb.mirage.org/bugzilla/xliveless/main.c
+
+namespace {
+
+std::string HexBytes(const uint8_t* p, size_t n) {
+  std::string out;
+  char b[4];
+  for (size_t i = 0; i < n; ++i) {
+    std::snprintf(b, sizeof(b), "%02X", p[i]);
+    out += b;
+    if ((i & 3) == 3 && i + 1 < n) out += ' ';
+  }
+  return out;
+}
+
+}  // namespace
+
+// Unknown messages are often polled every frame. Log the first few calls per
+// message with a dump of the argument block (and of the blocks its first
+// words point at) so the layout can be worked out, then stay quiet.
+void XLiveBaseApp::LogUnimplemented(uint32_t message, uint32_t buffer_ptr,
+                                    uint32_t buffer_length) {
+  static std::mutex mutex;
+  static std::map<uint32_t, uint32_t> counts;
+  uint32_t seen;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    seen = counts[message]++;
+  }
+  if (seen >= 4) {
+    if (seen == 4) {
+      REXKRNL_WARN("XLIVEBASE message {:08X}: further calls not logged", message);
+    }
+    return;
+  }
+  REXKRNL_ERROR("Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, arg2={:08X}",
+                app_id(), message, buffer_ptr, buffer_length);
+  if (!buffer_ptr) {
+    return;
+  }
+  auto block = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
+  REXKRNL_ERROR("  arg1 @{:08X}: {}", buffer_ptr, HexBytes(block, 0x40));
+  for (uint32_t i = 0; i < 8; ++i) {
+    uint32_t ptr = memory::load_and_swap<uint32_t>(block + i * 4);
+    auto heap = ptr ? memory_->LookupHeap(ptr) : nullptr;
+    uint32_t protect = 0;
+    if (heap && heap->QueryProtect(ptr, &protect) && (protect & memory::kMemoryProtectRead) &&
+        heap->QueryProtect(ptr + 0x1F, &protect) && (protect & memory::kMemoryProtectRead)) {
+      REXKRNL_ERROR("  arg1[{}] -> @{:08X}: {}", i, ptr,
+                    HexBytes(memory_->TranslateVirtual<uint8_t*>(ptr), 0x20));
+    }
+  }
+}
 
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
@@ -78,10 +135,7 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
   }
-  REXKRNL_ERROR(
-      "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
-      "arg2={:08X}",
-      app_id(), message, buffer_ptr, buffer_length);
+  LogUnimplemented(message, buffer_ptr, buffer_length);
   return X_E_FAIL;
 }
 

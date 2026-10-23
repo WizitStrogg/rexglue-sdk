@@ -7,6 +7,7 @@
  */
 
 #include "xam_session.h"
+#include "xam_lan_lobby.h"
 
 #include <cstddef>
 #include <cstring>
@@ -270,6 +271,7 @@ X_HRESULT Create(uint8_t* buffer) {
     systemlink::set_registered_session_id(xnkid_value(s.info.sessionID));
   }
   s.created = true;
+  lobby::Start();
 
   REXKRNL_INFO("XSessionCreate obj={:08X} flags={:08X} slots={}+{} {} session {:016X} host {}",
                uint32_t(data->obj_ptr), s.flags, s.max_public, s.max_private,
@@ -454,6 +456,20 @@ X_HRESULT MigrateHost(uint8_t* buffer) {
   REXKRNL_INFO("XSessionMigrateHost obj={:08X} -> {}", uint32_t(data->obj_ptr),
                s->host ? "local" : "remote");
   return X_E_SUCCESS;
+}
+
+std::vector<HostedSession> HostedSessions() {
+  std::lock_guard lock(mutex);
+  std::vector<HostedSession> out;
+  for (const auto& [obj, s] : sessions) {
+    if (!s.created || !s.host || s.state == SessionState::kDeleted ||
+        !(s.flags & kPeerNetwork)) {
+      continue;
+    }
+    out.push_back({s.info, s.flags, s.max_public, s.max_private, s.used_public(), s.used_private(),
+                   local_xuid()});
+  }
+  return out;
 }
 
 }  // namespace rex::kernel::xam::session

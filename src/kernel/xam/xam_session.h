@@ -18,7 +18,9 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
+#include <rex/kernel/xam/systemlink.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xam::session {
@@ -37,5 +39,17 @@ X_HRESULT End(uint8_t* buffer);
 X_HRESULT Modify(uint8_t* buffer);
 X_HRESULT GetDetails(uint8_t* buffer);
 X_HRESULT MigrateHost(uint8_t* buffer);
+
+// Sessions this machine hosts, for LAN advertisement.
+struct HostedSession {
+  XSESSION_INFO info;
+  uint32_t flags;
+  uint32_t max_public;
+  uint32_t max_private;
+  uint32_t used_public;
+  uint32_t used_private;
+  uint64_t host_xuid;
+};
+std::vector<HostedSession> HostedSessions();
 
 }  // namespace rex::kernel::xam::session
