@@ -213,6 +213,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
 
   void OnBeforeGuestVisibleWrite() override;
+  uint64_t PrepareAsyncGuestVisibleWrite() override;
+  bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
   void PrepareForWait() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -772,6 +774,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // (readback_memexport_deferred), and their total size.
   std::vector<draw_util::MemExportRange> memexport_readback_deferred_ranges_;
   uint32_t memexport_readback_deferred_size_ = 0;
+  // Persistently mapped readback buffers for asynchronous memexport readback
+  // (readback_memexport_async), reused once their data is copied to the guest.
+  struct AsyncReadbackBuffer {
+    ID3D12Resource* buffer = nullptr;
+    void* mapping = nullptr;
+    uint32_t size = 0;
+    bool in_use = false;
+  };
+  std::vector<AsyncReadbackBuffer> async_readback_buffers_;
 };
 
 }  // namespace rex::graphics::d3d12

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -45,6 +46,13 @@ REXCVAR_DEFINE_BOOL(readback_memexport_deferred, true, "GPU/D3D12",
                     "(fences, interrupts, swaps) or waits, instead of after every draw. Gives "
                     "the CPU current data without stalling the GPU per draw. Overrides "
                     "readback_memexport_fast.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
+                    "With readback_memexport_deferred, don't wait for the GPU before fence "
+                    "writes and interrupts. Copy the memexport results back asynchronously and "
+                    "delay those writes until the copy has completed, keeping the command "
+                    "processor and the GPU working in parallel.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
@@ -1645,6 +1653,12 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   memexport_readback_deferred_ranges_.clear();
   memexport_readback_deferred_size_ = 0;
+  async_guest_writes_.clear();
+  for (AsyncReadbackBuffer& readback : async_readback_buffers_) {
+    readback.buffer->Unmap(0, nullptr);
+    readback.buffer->Release();
+  }
+  async_readback_buffers_.clear();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2788,8 +2802,87 @@ void D3D12CommandProcessor::FlushDeferredMemexportReadback() {
 void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() { FlushDeferredMemexportReadback(); }
 
 void D3D12CommandProcessor::PrepareForWait() {
-  FlushDeferredMemexportReadback();
+  // The asynchronous writes are older than the deferred ranges.
   CommandProcessor::PrepareForWait();
+  FlushDeferredMemexportReadback();
+}
+
+uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
+  if (memexport_readback_deferred_ranges_.empty() || !REXCVAR_GET(readback_memexport_async) ||
+      !submission_open_) {
+    return 0;
+  }
+  uint32_t total_size = memexport_readback_deferred_size_;
+
+  AsyncReadbackBuffer* readback = nullptr;
+  for (AsyncReadbackBuffer& buffer : async_readback_buffers_) {
+    if (!buffer.in_use && buffer.size >= total_size &&
+        (!readback || buffer.size < readback->size)) {
+      readback = &buffer;
+    }
+  }
+  if (!readback) {
+    uint32_t size = std::max(uint32_t(1) << 16, total_size);
+    size = std::bit_ceil(size);
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* buffer;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      return 0;
+    }
+    D3D12_RANGE read_range = {0, size};
+    void* mapping;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      buffer->Release();
+      return 0;
+    }
+    async_readback_buffers_.push_back({buffer, mapping, size, false});
+    readback = &async_readback_buffers_.back();
+  }
+  readback->in_use = true;
+  size_t readback_index = size_t(readback - async_readback_buffers_.data());
+
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_readback_deferred_ranges_) {
+    deferred_command_list_.D3DCopyBufferRegion(readback->buffer, readback_offset,
+                                               shared_memory_buffer,
+                                               memexport_range.base_address_dwords << 2,
+                                               memexport_range.size_bytes);
+    readback_offset += memexport_range.size_bytes;
+  }
+
+  // Submit now so the GPU starts on it while the command processor goes on.
+  uint64_t token = submission_current_;
+  EndSubmission(false);
+
+  QueueAsyncGuestVisibleWrite(
+      token, [this, readback_index, ranges = std::move(memexport_readback_deferred_ranges_)]() {
+        AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
+        const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
+        for (const draw_util::MemExportRange& memexport_range : ranges) {
+          std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                      readback_bytes, memexport_range.size_bytes);
+          readback_bytes += memexport_range.size_bytes;
+        }
+        readback.in_use = false;
+      });
+  memexport_readback_deferred_ranges_.clear();
+  memexport_readback_deferred_size_ = 0;
+  return token;
+}
+
+bool D3D12CommandProcessor::IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) {
+  if (submission_completed_ >= token) {
+    return true;
+  }
+  CheckSubmissionFence(wait ? token : 0);
+  return submission_completed_ >= token;
 }
 
 bool D3D12CommandProcessor::MemexportReadbackFullPath(
