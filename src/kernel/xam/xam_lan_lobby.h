@@ -51,6 +51,7 @@ struct InviteInfo {
   uint32_t title_id;
   char gamertag[16];
   XSESSION_INFO host_info;
+  bool from_game_invite;  // false for "join session" (join via presence)
 };
 bool SendInvite(uint64_t invitee_xuid, uint64_t inviter_xuid);
 bool TakeAcceptedInvite(InviteInfo* out);

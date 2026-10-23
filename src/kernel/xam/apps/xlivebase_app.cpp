@@ -319,8 +319,9 @@ X_HRESULT XLiveBaseApp::XInviteGetAcceptedInfo(uint32_t args_ptr) {
   memory::store_and_swap<uint64_t>(info + 0x08, invite.xuid_inviter);
   memory::store_and_swap<uint32_t>(info + 0x10, invite.title_id);
   std::memcpy(info + 0x14, &invite.host_info, sizeof(XSESSION_INFO));
-  memory::store_and_swap<uint32_t>(info + 0x50, 1);
-  REXKRNL_INFO("XInviteGetAcceptedInfo -> invite from '{}' to session {:016X}", invite.gamertag,
+  memory::store_and_swap<uint32_t>(info + 0x50, invite.from_game_invite ? 1 : 0);
+  REXKRNL_INFO("XInviteGetAcceptedInfo -> {} from '{}' ({:016X}) to session {:016X}",
+               invite.from_game_invite ? "invite" : "join", invite.gamertag, invite.xuid_inviter,
                memory::load_and_swap<uint64_t>(invite.host_info.sessionID.ab));
   return X_E_SUCCESS;
 }
@@ -352,6 +353,17 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
     }
     case 0x00058020: {
       return XFriendsCreateEnumerator(buffer_ptr, buffer_length);
+    }
+    case 0x0005800E: {
+      // XUserMuteListQuery { u32 user_index; u64 remote_xuid; u32 } -> BOOL muted
+      // at buffer_length. Nobody is muted on the LAN.
+      if (!buffer_ptr || !buffer_length) {
+        return X_E_INVALIDARG;
+      }
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint8_t*>(buffer_length), 0);
+      REXKRNL_DEBUG("XUserMuteListQuery({:016X}) -> not muted",
+                    memory::load_and_swap<uint64_t>(memory_->TranslateVirtual<uint8_t*>(buffer_ptr) + 8));
+      return X_E_SUCCESS;
     }
     case 0x00058023: {
       return XInviteGetAcceptedInfo(buffer_length);

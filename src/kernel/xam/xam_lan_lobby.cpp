@@ -271,6 +271,7 @@ void handle_invite(const uint8_t* data, size_t size, uint32_t from_ip) {
   r.bytes(&invite.host_info, sizeof(invite.host_info));
   if (!r.ok || invite.title_id != REX_KERNEL_STATE()->title_id()) return;
   systemlink::xnaddr_from_ip(from_ip, &invite.host_info.hostAddress);
+  invite.from_game_invite = true;
   REXKRNL_INFO("LAN lobby: game invite from '{}' ({}) to session {:016X}", invite.gamertag,
                systemlink::ip_to_string(from_ip), session_id(invite.host_info));
   {
@@ -306,6 +307,7 @@ bool join_remote(uint32_t only_ip) {
     invite.xuid_invitee = 0;
     std::memcpy(invite.gamertag, target->gamertag, sizeof(invite.gamertag));
     invite.host_info = target->info;
+    invite.from_game_invite = false;
     accepted_invite = invite;
   }
   REXKRNL_INFO("LAN lobby: joining '{}' at {} (session {:016X})", target->gamertag,

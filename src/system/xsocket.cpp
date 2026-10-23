@@ -17,6 +17,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <vector>
 
 #include <rex/kernel/xam/systemlink.h>
@@ -425,6 +428,25 @@ int XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
   return -1;
 }
 
+namespace {
+// Logs the first datagram exchanged with each peer per local port, so a log
+// shows whether two machines actually talk without flooding it.
+void NoteTraffic(bool outgoing, uint16_t local_port, const sockaddr_in& peer, int bytes) {
+  static std::mutex mutex;
+  static std::set<std::tuple<bool, uint16_t, uint32_t, uint16_t>> seen;
+  const uint32_t ip = ntohl(peer.sin_addr.s_addr);
+  const uint16_t port = ntohs(peer.sin_port);
+  {
+    std::lock_guard lock(mutex);
+    if (seen.size() > 256 || !seen.insert({outgoing, local_port, ip, port}).second) {
+      return;
+    }
+  }
+  REXKRNL_INFO("XSocket: first packet {} {}:{} on local port {} ({} bytes)",
+               outgoing ? "to" : "from", systemlink::ip_to_string(ip), port, local_port, bytes);
+}
+}  // namespace
+
 void XSocket::TranslateDestination(const XSOCKADDR_IN& guest, void* host_ptr) const {
   auto* host = static_cast<sockaddr_in*>(host_ptr);
   to_host_sockaddr(guest, host);
@@ -562,6 +584,9 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, XSOCKADDR_
   int ret = ::recvfrom(to_native(native_handle_), reinterpret_cast<char*>(buf), buf_len, flags,
                        reinterpret_cast<sockaddr*>(&addr), &len);
   if (ret >= 0) {
+    if (!is_tcp()) {
+      NoteTraffic(false, bound_port_, addr, ret);
+    }
     if (is_tcp()) {
       // The console reports the peer even for stream sockets.
       len = sizeof(addr);
@@ -585,6 +610,10 @@ int XSocket::SendTo(const uint8_t* buf, uint32_t buf_len, uint32_t flags, const 
     TranslateDestination(*to, &addr);
     ret = ::sendto(to_native(native_handle_), reinterpret_cast<const char*>(buf), buf_len, flags,
                    reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (ret >= 0) {
+      NoteImplicitBind();
+      NoteTraffic(true, bound_port_, addr, ret);
+    }
   } else {
     ret = ::sendto(to_native(native_handle_), reinterpret_cast<const char*>(buf), buf_len, flags,
                    nullptr, 0);
