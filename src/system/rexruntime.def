@@ -300,6 +300,8 @@ __imp__NetDll_XNetXnAddrToInAddr
 __imp__NetDll_XNetXnAddrToMachineId
 __imp__NetDll___WSAFDIsSet
 ?GetLobbyStatus@lobby@xam@kernel@rex@@YA?AULobbyStatus@1234@XZ
+?JoinLanPeer@lobby@xam@kernel@rex@@YA_NI@Z
+?GetLanPeers@lobby@xam@kernel@rex@@YA?AV?$vector@ULanPeer@lobby@xam@kernel@rex@@V?$allocator@ULanPeer@lobby@xam@kernel@rex@@@std@@@std@@XZ
 ?GetPeerData@lobby@xam@kernel@rex@@YA?AV?$vector@UPeerData@lobby@xam@kernel@rex@@V?$allocator@UPeerData@lobby@xam@kernel@rex@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@6@@Z
 ?PublishData@lobby@xam@kernel@rex@@YA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z
 rex_input_set_state_filter
