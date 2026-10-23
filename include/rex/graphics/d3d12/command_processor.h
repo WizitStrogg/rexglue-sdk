@@ -212,6 +212,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
 
+  void OnBeforeGuestVisibleWrite() override;
+  void PrepareForWait() override;
+
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
 
@@ -367,6 +370,11 @@ class D3D12CommandProcessor : public CommandProcessor {
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+  bool MemexportReadbackFullPath(const std::vector<draw_util::MemExportRange>& ranges,
+                                 uint32_t total_size);
+  // Reads back the memexport destinations deferred since the last guest-visible
+  // write, waiting for the GPU once for all of them.
+  void FlushDeferredMemexportReadback();
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
@@ -760,6 +768,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+  // Memexport destinations to read back at the next guest-visible write
+  // (readback_memexport_deferred), and their total size.
+  std::vector<draw_util::MemExportRange> memexport_readback_deferred_ranges_;
+  uint32_t memexport_readback_deferred_size_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12
