@@ -104,9 +104,7 @@ EXPORTS
 ?GetLogger@rex@@YA?AV?$shared_ptr@Vlogger@spdlog@@@std@@XZ
 ?GetLoggerRaw@rex@@YAPEAVlogger@spdlog@@ULogCategoryId@1@@Z
 ?GetPackedMipOffset@texture_util@graphics@rex@@YA_NIIIW4TextureFormat@xenos@23@IAEAI11@Z
-?GetPeerData@lobby@xam@kernel@rex@@YA?AV?$vector@UPeerData@lobby@xam@kernel@rex@@U?$allocator@UPeerData@lobby@xam@kernel@rex@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@U?$allocator@D@2@@6@@Z
 ?GetSnapshotCounter@perf@rex@@YA_JW4CounterId@12@@Z
-?PublishData@lobby@xam@kernel@rex@@YA_NAEBV?$basic_string@DU?$char_traits@D@std@@U?$allocator@D@2@@std@@0@Z
 ?SetCounter@perf@rex@@YAXW4CounterId@12@_J@Z
 ?ResetFrameCounters@perf@rex@@YAXXZ
 ?GetSubresourcesFromFetchConstant@texture_util@graphics@rex@@YAXAEBTxe_gpu_texture_fetch_t@xenos@23@PEAI111111@Z
@@ -300,6 +298,9 @@ __imp__NetDll_XNetUnregisterKey
 __imp__NetDll_XNetXnAddrToInAddr
 __imp__NetDll_XNetXnAddrToMachineId
 __imp__NetDll___WSAFDIsSet
+?GetLobbyStatus@lobby@xam@kernel@rex@@YA?AULobbyStatus@1234@XZ
+?GetPeerData@lobby@xam@kernel@rex@@YA?AV?$vector@UPeerData@lobby@xam@kernel@rex@@V?$allocator@UPeerData@lobby@xam@kernel@rex@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@6@@Z
+?PublishData@lobby@xam@kernel@rex@@YA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z
 __imp__NetDll_accept
 __imp__NetDll_bind
 __imp__NetDll_closesocket
