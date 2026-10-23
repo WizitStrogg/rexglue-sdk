@@ -15,6 +15,7 @@
 #include <rex/system/xam/user_profile.h>
 #include <rex/thread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +75,22 @@ void XLiveBaseApp::LogUnimplemented(uint32_t message, uint32_t buffer_ptr,
   }
   auto block = memory_->TranslateVirtual<uint8_t*>(buffer_ptr);
   REXKRNL_ERROR("  arg1 @{:08X}: {}", buffer_ptr, HexBytes(block, 0x40));
+  if (buffer_length == 0x28) {
+    // Async LIVE task: dump the XLIVE_ASYNC_TASK and its marshalled request.
+    const uint32_t task_ptr = memory::load_and_swap<uint32_t>(block);
+    auto task_heap = task_ptr ? memory_->LookupHeap(task_ptr) : nullptr;
+    if (task_heap) {
+      auto* task = memory_->TranslateVirtual<uint8_t*>(task_ptr);
+      REXKRNL_ERROR("  task @{:08X}: {}", task_ptr, HexBytes(task, 0x40));
+      const uint32_t request_ptr = memory::load_and_swap<uint32_t>(task + 0x18);
+      const uint32_t request_size = memory::load_and_swap<uint32_t>(task + 0x1C);
+      if (request_ptr && memory_->LookupHeap(request_ptr)) {
+        REXKRNL_ERROR("  request @{:08X} ({} bytes): {}", request_ptr, request_size,
+                      HexBytes(memory_->TranslateVirtual<uint8_t*>(request_ptr),
+                               std::min<uint32_t>(std::max<uint32_t>(request_size, 0x20), 0x80)));
+      }
+    }
+  }
   for (uint32_t i = 0; i < 8; ++i) {
     uint32_t ptr = memory::load_and_swap<uint32_t>(block + i * 4);
     auto heap = ptr ? memory_->LookupHeap(ptr) : nullptr;
