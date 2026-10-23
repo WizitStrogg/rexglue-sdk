@@ -20,6 +20,10 @@
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/systemlink.h>
+#include <rex/system/xam/user_profile.h>
+
+#include "xam_lan_lobby.h"
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/xtypes.h>
@@ -550,6 +554,39 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
 
+// There is no Xbox guide: an invite UI sends straight to the chosen LAN
+// players (or to every LAN player when the title passes none).
+u32 XamShowGameInviteUI_entry(u32 user_index, mapped_u64 recipients, u32 count, u32 text_ptr) {
+  (void)text_ptr;
+  if (user_index != 0) {
+    return X_ERROR_NO_SUCH_USER;
+  }
+  const uint64_t inviter = systemlink::online_xuid(REX_KERNEL_STATE()->user_profile()->xuid());
+  uint32_t sent = 0;
+  if (recipients && count) {
+    for (uint32_t i = 0; i < std::min<uint32_t>(count, 100); ++i) {
+      sent += lobby::SendInvite(recipients.as<rex::be<uint64_t>*>()[i], inviter) ? 1 : 0;
+    }
+  } else {
+    for (const auto& player : lobby::RemotePlayers()) {
+      sent += lobby::SendInvite(player.xuid, inviter) ? 1 : 0;
+    }
+  }
+  REXKRNL_INFO("XamShowGameInviteUI: sent {} LAN invite(s)", sent);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowFriendsUI_entry(u32 user_index) {
+  REXKRNL_INFO("XamShowFriendsUI({}) - no guide, ignored", (uint32_t)user_index);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamShowGamerCardUIForXUID_entry(u32 user_index, u64 xuid) {
+  REXKRNL_INFO("XamShowGamerCardUIForXUID({}, {:016X}) - no guide, ignored", (uint32_t)user_index,
+               (uint64_t)xuid);
+  return X_ERROR_SUCCESS;
+}
+
 uint32_t XamShowMessageBoxUIEx_entry() {
   // TODO(tomc): implement properly
   static bool warned = false;
@@ -609,12 +646,12 @@ REX_EXPORT_STUB(__imp__XamShowFitnessWarnAboutTimeUI);
 REX_EXPORT_STUB(__imp__XamShowFofUI);
 REX_EXPORT_STUB(__imp__XamShowForcedNameChangeUI);
 REX_EXPORT_STUB(__imp__XamShowFriendRequestUI);
-REX_EXPORT_STUB(__imp__XamShowFriendsUI);
+REX_EXPORT(__imp__XamShowFriendsUI, rex::kernel::xam::XamShowFriendsUI_entry)
 REX_EXPORT_STUB(__imp__XamShowFriendsUIp);
-REX_EXPORT_STUB(__imp__XamShowGameInviteUI);
+REX_EXPORT(__imp__XamShowGameInviteUI, rex::kernel::xam::XamShowGameInviteUI_entry)
 REX_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);
 REX_EXPORT_STUB(__imp__XamShowGamerCardUI);
-REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUID);
+REX_EXPORT(__imp__XamShowGamerCardUIForXUID, rex::kernel::xam::XamShowGamerCardUIForXUID_entry)
 REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUIDp);
 REX_EXPORT_STUB(__imp__XamShowGamesUI);
 REX_EXPORT_STUB(__imp__XamShowGenericOnlineAppUI);
