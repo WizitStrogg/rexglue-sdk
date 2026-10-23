@@ -3,6 +3,7 @@ EXPORTS
 ??0AchievementsOverlayDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@PEAVImmediateDrawer@12@PEAVRuntime@2@PEAVAchievementManager@system@2@@Z
 ??0ConsoleDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@V?$shared_ptr@VLogCaptureSink@rex@@@std@@@Z
 ??0CoopDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@Vpath@filesystem@std@@@Z
+??0LobbyPanelDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@@Z
 ??0D3D12DescriptorHeapPool@d3d12@ui@rex@@QEAA@PEAUID3D12Device@@W4D3D12_DESCRIPTOR_HEAP_TYPE@@I@Z
 ??0D3D12UploadBufferPool@d3d12@ui@rex@@QEAA@AEBVD3D12Provider@123@_K@Z
 ??0DebugOverlayDialog@ui@rex@@QEAA@PEAVImGuiDrawer@12@V?$function@$$A6A?AUFrameStats@ui@rex@@XZ@std@@@Z
@@ -302,6 +303,7 @@ __imp__NetDll___WSAFDIsSet
 ?GetPeerData@lobby@xam@kernel@rex@@YA?AV?$vector@UPeerData@lobby@xam@kernel@rex@@V?$allocator@UPeerData@lobby@xam@kernel@rex@@@std@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@6@@Z
 ?PublishData@lobby@xam@kernel@rex@@YA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@0@Z
 rex_input_set_state_filter
+rex_ui_set_lobby_view
 __imp__NetDll_accept
 __imp__NetDll_bind
 __imp__NetDll_closesocket

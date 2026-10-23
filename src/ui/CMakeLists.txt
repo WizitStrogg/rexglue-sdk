@@ -30,6 +30,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
     overlay/coop_overlay.cpp
+    overlay/lobby_panel.cpp
 )
 
 # Vulkan UI backend
