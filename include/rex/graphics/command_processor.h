@@ -310,6 +310,20 @@ class CommandProcessor {
   } async_diag_;
   std::chrono::steady_clock::time_point async_diag_last_log_ = std::chrono::steady_clock::now();
   void LogAsyncGuestWriteDiag();
+  // Last EVENT_WRITE_SHD of each kind (physical dword address, value written),
+  // logged if the command processor stays idle long, to diagnose guest hangs
+  // waiting for a GPU fence or counter.
+  uint32_t last_shd_counter_address_ = 0;
+  uint32_t last_shd_counter_value_ = 0;
+  xenos::Endian last_shd_counter_endian_ = xenos::Endian::kNone;
+  // Idle-time refreshes of the counter in guest memory (see the cvar).
+  uint32_t idle_counter_refreshes_ = 0;
+  void RefreshCounterWhileIdle();
+  uint32_t last_shd_value_address_ = 0;
+  uint32_t last_shd_value_value_ = 0;
+  uint32_t last_wait_reg_mem_address_ = 0;
+  uint32_t last_wait_reg_mem_reference_ = 0;
+  void LogIdleStall(std::chrono::steady_clock::duration idle_time);
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
