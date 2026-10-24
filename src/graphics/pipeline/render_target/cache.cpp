@@ -44,6 +44,12 @@ REXCVAR_DEFINE_BOOL(skip_redundant_stencil_transfers, true, "GPU",
                     "depth or nothing has been written since, such as depth switching between "
                     "1x and 4x MSAA), copy only the depth and keep the stencil.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skip_unconsumed_stencil_transfers, true, "GPU",
+                    "With host render targets, don't copy the stencil in depth render target "
+                    "transfers until a draw that uses the stencil values (stencil test other "
+                    "than always, or increment / decrement / invert operations) is seen. From "
+                    "then on, stencil is copied.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skip_redundant_render_target_transfers, true, "GPU",
                     "With host render targets, don't transfer EDRAM data back to a render "
                     "target that still holds it: the range's owner got it from that render "
@@ -779,6 +785,36 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       writes = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
                normalized_depth_control.stencil_enable;
       writes_stencil = draw_writes_stencil;
+      if (normalized_depth_control.stencil_enable && !stencil_values_consumed_) {
+        auto face_consumes_stencil = [](xenos::CompareFunction func, xenos::StencilOp fail,
+                                        xenos::StencilOp zpass, xenos::StencilOp zfail) {
+          if (func != xenos::CompareFunction::kAlways) {
+            return true;
+          }
+          for (xenos::StencilOp op : {fail, zpass, zfail}) {
+            if (op != xenos::StencilOp::kKeep && op != xenos::StencilOp::kZero &&
+                op != xenos::StencilOp::kReplace) {
+              return true;
+            }
+          }
+          return false;
+        };
+        bool consumes = face_consumes_stencil(
+            normalized_depth_control.stencilfunc, normalized_depth_control.stencilfail,
+            normalized_depth_control.stencilzpass, normalized_depth_control.stencilzfail);
+        if (normalized_depth_control.backface_enable) {
+          consumes |= face_consumes_stencil(
+              normalized_depth_control.stencilfunc_bf, normalized_depth_control.stencilfail_bf,
+              normalized_depth_control.stencilzpass_bf, normalized_depth_control.stencilzfail_bf);
+        }
+        if (consumes) {
+          stencil_values_consumed_ = true;
+          REXGPU_INFO(
+              "RenderTargetCache: A draw uses the stencil values (RB_DEPTHCONTROL {:08X}), "
+              "copying the stencil in render target transfers from now on",
+              normalized_depth_control.value);
+        }
+      }
       if (draw_writes_stencil) {
         diag::stencil_write_draws.fetch_add(1, std::memory_order_relaxed);
         diag::draw_stencil_bits_or.fetch_or(draw_stencil_bits, std::memory_order_relaxed);
@@ -1296,6 +1332,10 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_targets_.emplace(key, render_target);
   }
   return render_target;
+}
+
+bool RenderTargetCache::AreStencilTransfersNeeded() const {
+  return stencil_values_consumed_ || !REXCVAR_GET(skip_unconsumed_stencil_transfers);
 }
 
 void RenderTargetCache::UpdateOwnershipRangeStencilBits(RenderTargetKey key,

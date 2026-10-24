@@ -4397,7 +4397,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
       bool need_stencil_bit_draws = dest_rt_key.is_depth && !use_stencil_reference_output_ &&
-                                    REXCVAR_GET(d3d12_transfer_stencil);
+                                    REXCVAR_GET(d3d12_transfer_stencil) &&
+                                    AreStencilTransfersNeeded();
       current_transfer_invocations_.clear();
       current_transfer_invocations_.reserve(current_transfers.size()
                                             << uint32_t(need_stencil_bit_draws));

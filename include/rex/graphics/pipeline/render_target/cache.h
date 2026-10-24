@@ -498,6 +498,14 @@ class RenderTargetCache {
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
+  // Whether depth render target transfers need to copy the stencil: if no draw
+  // so far has used the stencil values (tested them or updated them based on
+  // the current value), and resolves don't expose stencil to shaders (k_24_8
+  // textures are sampled as depth only), skipping the stencil is invisible.
+  bool AreStencilTransfersNeeded() const;
+  // Set once a draw depending on the current stencil values is seen.
+  bool stencil_values_consumed_ = false;
+
   void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
