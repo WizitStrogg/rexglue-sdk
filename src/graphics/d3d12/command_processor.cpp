@@ -3335,7 +3335,7 @@ void D3D12CommandProcessor::ExecuteSubmissionJob(SubmissionJob& job, DeferredCom
 }
 
 void D3D12CommandProcessor::SubmissionThreadMain() {
-  rex::thread::set_current_thread_name("GPU Submission");
+  SetThreadDescription(GetCurrentThread(), L"GPU Submission");
   std::unique_lock<std::mutex> lock(submission_mutex_);
   while (true) {
     submission_work_cond_.wait(
