@@ -10,15 +10,24 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
+#include <rex/cvar.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, false, "GPU",
+                    "Experimental: when the CPU writes to memory holding GPU-written data that "
+                    "was not read back, upload only the dwords the CPU changed, keeping the "
+                    "GPU's results in the rest")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
 
@@ -95,6 +104,33 @@ void SharedMemory::InvalidateAllPages() {
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
             system_page_flags_valid_and_gpu_written_.end(), uint64_t(0));
+  cpu_write_snapshots_.clear();
+  cpu_write_snapshot_count_.store(0, std::memory_order_relaxed);
+}
+
+bool SharedMemory::TakeCpuWriteSnapshot(uint32_t page, std::vector<uint32_t>& snapshot_out) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = cpu_write_snapshots_.find(page);
+  if (it == cpu_write_snapshots_.end()) {
+    return false;
+  }
+  snapshot_out = std::move(it->second);
+  cpu_write_snapshots_.erase(it);
+  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()),
+                                  std::memory_order_relaxed);
+  return true;
+}
+
+void SharedMemory::DropCpuWriteSnapshots(uint32_t page_first, uint32_t page_last) {
+  // Called within the global critical region.
+  if (cpu_write_snapshots_.empty()) {
+    return;
+  }
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    cpu_write_snapshots_.erase(page);
+  }
+  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()),
+                                  std::memory_order_relaxed);
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -266,6 +302,11 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
+  {
+    // The GPU's data is newer than any snapshot of these pages.
+    auto global_lock = global_critical_region_.Acquire();
+    DropCpuWriteSnapshots(page_first, page_last);
+  }
 
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
@@ -524,6 +565,30 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     }
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    uint64_t gpu_written_bits = system_page_flags_valid_and_gpu_written_[i] & invalidate_bits;
+    if (gpu_written_bits) {
+      diag::cpu_writes_to_gpu_pages.fetch_add(uint64_t(std::popcount(gpu_written_bits)),
+                                              std::memory_order_relaxed);
+      if (REXCVAR_GET(shared_memory_preserve_gpu_writes)) {
+        // Still the old contents: the write that caused this hasn't happened.
+        uint32_t page_dwords = uint32_t(1) << (page_size_log2_ - 2);
+        uint32_t bit;
+        uint64_t bits = gpu_written_bits;
+        while (rex::bit_scan_forward(bits, &bit)) {
+          bits &= ~(uint64_t(1) << bit);
+          uint32_t page = (i << 6) + bit;
+          if (cpu_write_snapshots_.find(page) != cpu_write_snapshots_.end()) {
+            continue;
+          }
+          std::vector<uint32_t>& snapshot = cpu_write_snapshots_[page];
+          snapshot.resize(page_dwords);
+          std::memcpy(snapshot.data(), memory_.TranslatePhysical(page << page_size_log2_),
+                      page_dwords * sizeof(uint32_t));
+        }
+        cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()),
+                                        std::memory_order_relaxed);
+      }
     }
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;

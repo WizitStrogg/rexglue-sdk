@@ -17,6 +17,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -309,9 +310,8 @@ bool D3D12SharedMemory::UploadRanges(
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
-  for (auto upload_range : upload_page_ranges) {
-    uint32_t upload_range_start = upload_range.first;
-    uint32_t upload_range_length = upload_range.second;
+
+  auto upload_pages = [&](uint32_t upload_range_start, uint32_t upload_range_length) -> bool {
     while (upload_range_length != 0) {
       ID3D12Resource* upload_buffer;
       size_t upload_buffer_offset, upload_buffer_size;
@@ -333,6 +333,74 @@ bool D3D12SharedMemory::UploadRanges(
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
+    }
+    return true;
+  };
+
+  // Uploads only the dwords of the page that differ from the snapshot taken
+  // before the CPU wrote to it, keeping the GPU-written data in the rest.
+  auto upload_page_merged = [&](uint32_t page, const std::vector<uint32_t>& snapshot) -> bool {
+    uint32_t page_address = page << page_size_log2();
+    uint32_t page_dwords = uint32_t(snapshot.size());
+    MakeRangeValid(page_address, uint32_t(1) << page_size_log2(), true);
+    const uint32_t* current =
+        reinterpret_cast<const uint32_t*>(memory().TranslatePhysical(page_address));
+    uint32_t i = 0;
+    while (i < page_dwords) {
+      if (current[i] == snapshot[i]) {
+        ++i;
+        continue;
+      }
+      uint32_t run_end = i + 1;
+      while (run_end < page_dwords && current[run_end] != snapshot[run_end]) {
+        ++run_end;
+      }
+      diag::merged_dwords.fetch_add(run_end - i, std::memory_order_relaxed);
+      while (i < run_end) {
+        ID3D12Resource* upload_buffer;
+        size_t upload_buffer_offset, upload_buffer_size;
+        uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
+            command_processor_.GetCurrentSubmission(), (run_end - i) * sizeof(uint32_t),
+            sizeof(uint32_t), &upload_buffer, &upload_buffer_offset, &upload_buffer_size, nullptr);
+        if (upload_buffer_mapping == nullptr) {
+          REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
+          return false;
+        }
+        std::memcpy(upload_buffer_mapping, current + i, upload_buffer_size);
+        command_list.D3DCopyBufferRegion(buffer_, page_address + i * sizeof(uint32_t),
+                                         upload_buffer, UINT64(upload_buffer_offset),
+                                         UINT64(upload_buffer_size));
+        i += uint32_t(upload_buffer_size / sizeof(uint32_t));
+      }
+    }
+    diag::merged_page_uploads.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  };
+
+  std::vector<uint32_t> snapshot;
+  for (auto upload_range : upload_page_ranges) {
+    if (!HasCpuWriteSnapshots()) {
+      if (!upload_pages(upload_range.first, upload_range.second)) {
+        return false;
+      }
+      continue;
+    }
+    uint32_t run_start = upload_range.first;
+    uint32_t range_end = upload_range.first + upload_range.second;
+    for (uint32_t page = upload_range.first; page < range_end; ++page) {
+      if (!TakeCpuWriteSnapshot(page, snapshot)) {
+        continue;
+      }
+      if (page > run_start && !upload_pages(run_start, page - run_start)) {
+        return false;
+      }
+      if (!upload_page_merged(page, snapshot)) {
+        return false;
+      }
+      run_start = page + 1;
+    }
+    if (range_end > run_start && !upload_pages(run_start, range_end - run_start)) {
+      return false;
     }
   }
   return true;
