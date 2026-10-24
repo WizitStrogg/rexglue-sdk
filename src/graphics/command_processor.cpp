@@ -47,7 +47,7 @@ REXCVAR_DEFINE_BOOL(async_guest_writes_counter_immediate, false, "GPU",
                     "after the GPU work before it has completed")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 250, "GPU",
+REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
                      "When the command processor has had no commands for this many "
                      "milliseconds, write the current GPU counter to where the last counter "
                      "event wrote it, if it has advanced, so a guest polling that counter for a "
