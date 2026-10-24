@@ -2433,6 +2433,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   EndGpuProfileScope(transfers_profile_scope, diag::GpuCategory::kRenderTargetTransfers);
+  if (normalized_depth_control.stencil_enable) {
+    auto* depth_render_target = render_target_cache_->GetLastUpdateDepthRenderTarget();
+    if (depth_render_target) {
+      depth_render_target->SetStencilMaybeNonzero();
+    }
+  }
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to

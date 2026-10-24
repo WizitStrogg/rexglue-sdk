@@ -26,6 +26,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
@@ -46,6 +47,12 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
+
+REXCVAR_DEFINE_BOOL(d3d12_skip_zero_stencil_transfers, true, "GPU/D3D12",
+                    "Without native stencil value output (Nvidia), skip the 8 bit-by-bit "
+                    "stencil draws of a depth render target transfer when the source's stencil "
+                    "has never been written, as it's all zeros")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
 
@@ -4183,6 +4190,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             stencil_clear_rectangle_count += transfer.GetRectangles(
                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                 nullptr, resolve_clear_rectangle);
+            if (source_rt_key.is_depth && !source_d3d12_rt.stencil_maybe_nonzero() &&
+                REXCVAR_GET(d3d12_skip_zero_stencil_transfers)) {
+              // The source's stencil is all zeros - clearing the destination's
+              // stencil is enough, no need for the 8 bit-by-bit draws.
+              diag::stencil_bit_transfers_skipped.fetch_add(1, std::memory_order_relaxed);
+              continue;
+            }
+            diag::stencil_bit_transfers.fetch_add(1, std::memory_order_relaxed);
+            dest_d3d12_rt.SetStencilMaybeNonzero();
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_d3d12_rt) {
@@ -4571,6 +4587,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
         command_processor_.SubmitBarriers();
+        if (clear_value & 0xFF) {
+          dest_d3d12_rt.SetStencilMaybeNonzero();
+        }
         command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
                                               D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                                               depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
