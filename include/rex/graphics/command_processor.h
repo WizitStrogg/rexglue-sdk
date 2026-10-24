@@ -194,6 +194,7 @@ class CommandProcessor {
   bool HasAsyncGuestVisibleWrites() const { return !async_guest_writes_.empty(); }
   // Executes a fence write or an interrupt packet asynchronously if needed.
   // Returns false if the packet must be executed normally instead.
+  static bool CompareWaitValue(uint32_t wait_info, uint32_t value, uint32_t mask, uint32_t ref);
   bool TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode, uint32_t count,
                                   bool* result);
 
@@ -287,8 +288,16 @@ class CommandProcessor {
     std::function<void()> write;
     // Memory words the write stores (physical address of the dword, value as
     // stored in memory), so command processor waits can see them early, as
-    // the GPU would have written them by then.
-    std::vector<std::pair<uint32_t, uint32_t>> stores;
+    // the GPU would have written them by then. `expected` is the value the
+    // GPU saw there when the write was queued: if the memory holds something
+    // else when the write is done, the CPU has written it since, and the
+    // CPU's newer value is kept.
+    struct Store {
+      uint32_t address;
+      uint32_t value;
+      uint32_t expected;
+    };
+    std::vector<Store> stores;
   };
   // Returns the value of a memory dword as the GPU sees it at this point of
   // the command stream, including queued asynchronous writes.
@@ -307,6 +316,8 @@ class CommandProcessor {
     uint64_t wait_queue_hits = 0;
     uint64_t wait_drains = 0;
     uint64_t swaps = 0;
+    uint64_t stores_kept_cpu_value = 0;
+    uint64_t cond_writes = 0;
   } async_diag_;
   std::chrono::steady_clock::time_point async_diag_last_log_ = std::chrono::steady_clock::now();
   void LogAsyncGuestWriteDiag();
