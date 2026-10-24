@@ -710,15 +710,54 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   }
 
   // The previous owners of the ranges the draw writes no longer hold the same
-  // data.
+  // data. Also track the stencil bits that may become non-zero.
+  uint32_t draw_stencil_bits = 0;
+  if (normalized_depth_control.stencil_enable) {
+    auto get_face_stencil_bits = [](xenos::StencilOp fail, xenos::StencilOp zpass,
+                                    xenos::StencilOp zfail, reg::RB_STENCILREFMASK ref_mask) {
+      uint32_t bits = 0;
+      for (xenos::StencilOp op : {fail, zpass, zfail}) {
+        switch (op) {
+          case xenos::StencilOp::kKeep:
+          case xenos::StencilOp::kZero:
+            break;
+          case xenos::StencilOp::kReplace:
+            bits |= ref_mask.stencilref;
+            break;
+          default:
+            bits |= 0xFF;
+            break;
+        }
+      }
+      return bits & ref_mask.stencilwritemask;
+    };
+    draw_stencil_bits = get_face_stencil_bits(
+        normalized_depth_control.stencilfail, normalized_depth_control.stencilzpass,
+        normalized_depth_control.stencilzfail, regs.Get<reg::RB_STENCILREFMASK>());
+    if (normalized_depth_control.backface_enable) {
+      draw_stencil_bits |= get_face_stencil_bits(
+          normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzpass_bf,
+          normalized_depth_control.stencilzfail_bf,
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF));
+    }
+  }
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     uint32_t rt_bit_index = edram_bases_sorted[i].second;
     bool writes;
     if (rt_bit_index) {
       writes = ((normalized_color_mask >> ((rt_bit_index - 1) * 4)) & 0xF) != 0;
+      if (writes) {
+        // Anything in the depth / stencil interpretation.
+        UpdateOwnershipRangeStencilBits(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i], 0xFF,
+                                        false);
+      }
     } else {
       writes = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
                normalized_depth_control.stencil_enable;
+      if (draw_stencil_bits) {
+        UpdateOwnershipRangeStencilBits(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                                        draw_stencil_bits, false);
+      }
     }
     if (writes) {
       MarkOwnershipRangeWritten(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i]);
@@ -1141,11 +1180,21 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   clear_rectangle_out = clear_rectangle;
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
+  // Whether the clear fully covers the EDRAM tiles of its extent, so the
+  // stencil bits there are exactly those of the clear value.
+  uint32_t clear_tile_height_pixels = xenos::kEdramTileHeightSamples >> msaa_samples_y_log2;
+  bool clear_covers_whole_tiles =
+      !clear_rectangle.x_pixels && clear_rectangle.width_pixels == pitch_pixels &&
+      !(clear_rectangle.y_pixels % clear_tile_height_pixels) &&
+      !(clear_rectangle.height_pixels % clear_tile_height_pixels);
   if (depth_render_target) {
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
                     depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
     MarkOwnershipRangeWritten(depth_render_target_key, depth_clear_start_tiles_base_relative,
                               depth_clear_length_tiles);
+    UpdateOwnershipRangeStencilBits(depth_render_target_key, depth_clear_start_tiles_base_relative,
+                                    depth_clear_length_tiles, resolve_info.rb_depth_clear & 0xFF,
+                                    clear_covers_whole_tiles);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
@@ -1154,6 +1203,12 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
     MarkOwnershipRangeWritten(color_render_target_key, color_clear_start_tiles_base_relative,
                               color_clear_length_tiles);
+    // With 32bpp, the stencil in the depth / stencil interpretation is the low
+    // 8 bits of the value.
+    UpdateOwnershipRangeStencilBits(
+        color_render_target_key, color_clear_start_tiles_base_relative, color_clear_length_tiles,
+        resolve_info.color_edram_info.format_is_64bpp ? 0xFF : (resolve_info.rb_color_clear & 0xFF),
+        clear_covers_whole_tiles && !resolve_info.color_edram_info.format_is_64bpp);
   }
   return true;
 }
@@ -1207,6 +1262,38 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_targets_.emplace(key, render_target);
   }
   return render_target;
+}
+
+void RenderTargetCache::UpdateOwnershipRangeStencilBits(RenderTargetKey key,
+                                                        uint32_t start_tiles_base_relative,
+                                                        uint32_t length_tiles, uint32_t bits,
+                                                        bool assign) {
+  if (!length_tiles) {
+    return;
+  }
+  bits &= 0xFF;
+  auto update_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+    auto it = ownership_ranges_.lower_bound(extent_start);
+    if (it != ownership_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != ownership_ranges_.end() && it->first < extent_end; ++it) {
+      if (assign && it->first >= extent_start && it->second.end_tiles <= extent_end) {
+        it->second.stencil_bits = bits;
+      } else {
+        it->second.stencil_bits |= bits;
+      }
+    }
+  };
+  uint32_t start_tiles = (key.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  update_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    update_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
 }
 
 void RenderTargetCache::MarkOwnershipRangeWritten(RenderTargetKey key,
@@ -1392,6 +1479,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
               // Extend the last transfer if, for example, transferring color,
               // but host depth is different.
               transfers_append_out->back().end_tiles = transfer_end_tiles;
+              transfers_append_out->back().stencil_bits |= it->second.stencil_bits;
             } else {
               auto transfer_source_rt_it = render_targets_.find(transfer_source);
               if (transfer_source_rt_it != render_targets_.end()) {
@@ -1408,7 +1496,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                       it->first, transfer_end_tiles, transfer_source_rt_it->second,
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
-                          : nullptr);
+                          : nullptr,
+                      it->second.stencil_bits);
                 }
               }
             }
