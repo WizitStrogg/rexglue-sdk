@@ -28,6 +28,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
@@ -62,6 +63,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
+
+  // Measures the host GPU time of the work recorded in the scope for the
+  // diagnostics log, with d3d12_gpu_timestamps.
+  struct GpuProfileScope {
+    uint32_t query_index = UINT32_MAX;
+    size_t stream_size_before = 0;
+    size_t stream_size_after_query = 0;
+    uint64_t submission = 0;
+  };
+  GpuProfileScope BeginGpuProfileScope();
+  void EndGpuProfileScope(const GpuProfileScope& scope, diag::GpuCategory category);
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -687,14 +699,24 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
-  // GPU timestamps at the beginning and the end of each submission, for
-  // measuring host GPU time (gpu_diagnostics.h).
-  static constexpr uint32_t kTimestampSubmissionSlots = 256;
+  // GPU timestamps at the beginning and the end of each submission, and around
+  // categories of emulation work in it, for measuring host GPU time
+  // (gpu_diagnostics.h). Queries of a submission are at
+  // [slot * kTimestampsPerSubmission, + used): the submission's beginning and
+  // end, then pairs around the work of the scopes.
+  static constexpr uint32_t kTimestampSubmissionSlots = 64;
+  static constexpr uint32_t kTimestampsPerSubmission = 4096;
+  struct TimestampSlot {
+    uint64_t submission = 0;
+    uint32_t used = 0;
+    // Category and index of the first query of each scope's pair.
+    std::vector<std::pair<uint32_t, uint32_t>> scopes;
+  };
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_query_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
   const uint64_t* timestamp_readback_mapping_ = nullptr;
   uint64_t timestamp_frequency_ = 0;
-  uint64_t timestamp_slot_submission_[kTimestampSubmissionSlots] = {};
+  TimestampSlot timestamp_slots_[kTimestampSubmissionSlots];
   void InitializeTimestampResources();
   void ShutdownTimestampResources();
   void CollectTimestamps(uint64_t completed_before, uint64_t completed_now);

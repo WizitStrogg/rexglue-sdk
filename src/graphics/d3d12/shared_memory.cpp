@@ -307,6 +307,14 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  D3D12CommandProcessor::GpuProfileScope profile_scope = command_processor_.BeginGpuProfileScope();
+  struct ProfileScopeEnd {
+    D3D12CommandProcessor& command_processor;
+    const D3D12CommandProcessor::GpuProfileScope& scope;
+    ~ProfileScopeEnd() {
+      command_processor.EndGpuProfileScope(scope, diag::GpuCategory::kMemoryUploads);
+    }
+  } profile_scope_end{command_processor_, profile_scope};
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
