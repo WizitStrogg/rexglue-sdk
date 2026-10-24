@@ -61,6 +61,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submission_thread, false, "GPU/D3D12",
                     "driver's work runs in parallel with command processing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamps, false, "GPU/D3D12",
+                    "Measure the host GPU time of each submission with timestamp queries "
+                    "(for the performance diagnostics log)");
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1653,7 +1657,9 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
-  InitializeTimestampResources();
+  if (REXCVAR_GET(d3d12_gpu_timestamps)) {
+    InitializeTimestampResources();
+  }
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
