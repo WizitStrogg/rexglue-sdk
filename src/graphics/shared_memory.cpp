@@ -302,7 +302,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
-  {
+  if (cpu_write_snapshot_count_.load(std::memory_order_relaxed)) {
     // The GPU's data is newer than any snapshot of these pages.
     auto global_lock = global_critical_region_.Acquire();
     DropCpuWriteSnapshots(page_first, page_last);
@@ -566,7 +566,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
-    uint64_t gpu_written_bits = system_page_flags_valid_and_gpu_written_[i] & invalidate_bits;
+    uint64_t gpu_written_bits = REXCVAR_GET(shared_memory_preserve_gpu_writes)
+                                    ? system_page_flags_valid_and_gpu_written_[i] & invalidate_bits
+                                    : 0;
     if (gpu_written_bits) {
       diag::cpu_writes_to_gpu_pages.fetch_add(uint64_t(std::popcount(gpu_written_bits)),
                                               std::memory_order_relaxed);
