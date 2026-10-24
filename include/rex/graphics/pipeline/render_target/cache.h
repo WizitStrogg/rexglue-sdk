@@ -294,40 +294,28 @@ class RenderTargetCache {
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
 
-    // Stencil bits of a depth render target that may be non-zero anywhere in
-    // it (the write masks of draws with stencil enabled, non-zero bits of
-    // clears, and the bits of transfer sources). Transfers from a depth render
-    // target only need to copy these bits when the host can't output stencil
-    // from shaders and has to copy it bit by bit.
-    uint32_t stencil_maybe_nonzero_bits() const { return stencil_maybe_nonzero_bits_; }
-    void AddStencilMaybeNonzeroBits(uint32_t bits) { stencil_maybe_nonzero_bits_ |= bits & 0xFF; }
-
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
 
    private:
     RenderTargetKey key_;
-    uint32_t stencil_maybe_nonzero_bits_ = 0;
   };
-
- public:
-  RenderTarget* GetLastUpdateDepthRenderTarget() const {
-    return last_update_used_render_targets_[0];
-  }
-
- protected:
 
   struct Transfer {
     uint32_t start_tiles;
     uint32_t end_tiles;
     RenderTarget* source;
     RenderTarget* host_depth_source;
+    // Stencil bits that may be non-zero in the transferred range (see
+    // OwnershipRange::stencil_bits).
+    uint32_t stencil_bits = 0xFF;
     Transfer(uint32_t start_tiles, uint32_t end_tiles, RenderTarget* source,
-             RenderTarget* host_depth_source)
+             RenderTarget* host_depth_source, uint32_t stencil_bits = 0xFF)
         : start_tiles(start_tiles),
           end_tiles(end_tiles),
           source(source),
-          host_depth_source(host_depth_source) {
+          host_depth_source(host_depth_source),
+          stencil_bits(stencil_bits) {
       assert_true(start_tiles < end_tiles);
     }
     struct Rectangle {
@@ -603,6 +591,12 @@ class RenderTargetCache {
     // to the range since then. Taking the ownership back to it then doesn't
     // need a transfer (with host render targets).
     RenderTargetKey clean_source;
+    // Bits of the stencil (in the depth / stencil interpretation of the data)
+    // that may be non-zero somewhere in the range: those draws with stencil
+    // writes may set, clear values, and all after anything else writing to
+    // it. Without stencil output from pixel shaders, transfers to depth copy
+    // stencil bit by bit, and only need these bits.
+    uint32_t stencil_bits = 0xFF;
     OwnershipRange(uint32_t end_tiles, RenderTargetKey render_target,
                    RenderTargetKey host_depth_render_target_unorm24,
                    RenderTargetKey host_depth_render_target_float24)
@@ -641,7 +635,7 @@ class RenderTargetCache {
       return render_target == other_range.render_target &&
              host_depth_render_target_unorm24 == other_range.host_depth_render_target_unorm24 &&
              host_depth_render_target_float24 == other_range.host_depth_render_target_float24 &&
-             clean_source == other_range.clean_source;
+             clean_source == other_range.clean_source && stencil_bits == other_range.stencil_bits;
     }
   };
 
@@ -666,6 +660,10 @@ class RenderTargetCache {
   // holds the same data.
   void MarkOwnershipRangeWritten(RenderTargetKey key, uint32_t start_tiles_base_relative,
                                  uint32_t length_tiles);
+  // Adds stencil bits that may be non-zero to the ranges, or with `assign`,
+  // sets them for the ranges fully within the extent (completely overwritten).
+  void UpdateOwnershipRangeStencilBits(RenderTargetKey key, uint32_t start_tiles_base_relative,
+                                       uint32_t length_tiles, uint32_t bits, bool assign);
   bool WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
                                             uint32_t start_tiles_base_relative,
                                             uint32_t length_tiles) const;
