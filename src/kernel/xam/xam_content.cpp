@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+#include <string>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xam/systemlink.h>
@@ -29,6 +32,14 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+// Saved-game enumeration narrowed to one slot by the game (empty = all).
+std::mutex g_save_filter_mutex;
+std::string g_save_filter;
+std::string save_filter() {
+  std::lock_guard<std::mutex> lock(g_save_filter_mutex);
+  return g_save_filter;
+}
 
 u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_ptr) {
   // Each bit in the mask represents a granted license. Available licenses
@@ -85,12 +96,23 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   }
 
   if (!device_info || device_info->device_id == DummyDeviceId::HDD) {
-    // Enumerate user-specific content
+    // Enumerate user-specific content. A game may narrow saved games to one
+    // slot (rex_content_set_save_filter), e.g. so its own Continue loads a
+    // chosen save directly instead of showing the save picker.
+    const std::string only = save_filter();
     auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
         static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
     for (const auto& content_data : content_datas) {
+      if (!only.empty() && content_data.content_type == XContentType::kSavedGame &&
+          content_data.file_name() != only) {
+        continue;
+      }
       auto item = e->AppendItem();
       *item = content_data;
+    }
+    if (!only.empty()) {
+      REXKRNL_INFO("[content] enumeration narrowed to save '{}': {} item(s)", only,
+                   e->item_count());
     }
 
     // Also enumerate common content (xuid=0)
@@ -478,3 +500,11 @@ REX_EXPORT_STUB(__imp__XamContentSetAttributes);
 REX_EXPORT_STUB(__imp__XamContentSetMediaMetaDataInternal);
 REX_EXPORT_STUB(__imp__XamContentSetThumbnailInternal);
 REX_EXPORT_STUB(__imp__XamContentWritePackageHeader);
+
+// Narrows saved-game enumeration to the slot `file_name` ("Hero003"); null or
+// "" lists every save again. Any thread.
+extern "C" void rex_content_set_save_filter(const char* file_name) {
+  std::lock_guard<std::mutex> lock(rex::kernel::xam::g_save_filter_mutex);
+  rex::kernel::xam::g_save_filter = file_name ? file_name : "";
+  REXKRNL_INFO("[content] save filter: '{}'", rex::kernel::xam::g_save_filter);
+}
