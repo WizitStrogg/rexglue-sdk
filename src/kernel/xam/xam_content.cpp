@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -35,6 +36,9 @@ using namespace rex::system::xam;
 
 // Saved-game enumeration narrowed to one slot by the game (empty = all).
 std::mutex g_save_filter_mutex;
+// A "Save" root is open (the game is loading or writing a save): read by the
+// game layer to hold co-op joins and captures off (rex_content_save_busy).
+std::atomic<int> g_save_root_open{0};
 std::string g_save_filter;
 std::string save_filter() {
   std::lock_guard<std::mutex> lock(g_save_filter_mutex);
@@ -245,6 +249,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     // Save-slot trace for co-op campaigns (Fable-2-Recomp specs/001, proof P4):
     // which slot is opened, how (flags & 0xF: 1 new, 2 always-create = the
     // folder is deleted first, 3 open, 4 open-always, 5 truncate) and where.
+    if (result == X_ERROR_SUCCESS && root_name == "Save") g_save_root_open.store(1);
     REXKRNL_INFO("[content] create root={} file={} type={:08X} flags={:X} disposition={} "
                  "result={:08X} path={}",
                  root_name, content_data.file_name(),
@@ -311,6 +316,7 @@ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   auto* content_manager = REX_KERNEL_STATE()->content_manager();
   const auto path = content_manager->GetOpenPackagePath(root_name.value());
   auto result = content_manager->CloseContent(root_name.value());
+  if (root_name.value() == "Save") rex::kernel::xam::g_save_root_open.store(0);
   REXKRNL_INFO("[content] close root={} result={:08X} path={}", root_name.value(), result,
                path.string());
 
@@ -503,6 +509,9 @@ REX_EXPORT_STUB(__imp__XamContentWritePackageHeader);
 
 // Narrows saved-game enumeration to the slot `file_name` ("Hero003"); null or
 // "" lists every save again. Any thread.
+// 1 while the game has its "Save" root open (loading or writing a save). Any thread.
+extern "C" int rex_content_save_busy() { return rex::kernel::xam::g_save_root_open.load(); }
+
 extern "C" void rex_content_set_save_filter(const char* file_name) {
   std::lock_guard<std::mutex> lock(rex::kernel::xam::g_save_filter_mutex);
   rex::kernel::xam::g_save_filter = file_name ? file_name : "";

@@ -307,6 +307,7 @@ __imp__NetDll___WSAFDIsSet
 rex_input_set_state_filter
 rex_ui_set_lobby_view
 rex_content_set_save_filter
+rex_content_save_busy
 __imp__NetDll_accept
 __imp__NetDll_bind
 __imp__NetDll_closesocket
