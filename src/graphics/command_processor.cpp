@@ -47,6 +47,13 @@ REXCVAR_DEFINE_BOOL(async_guest_writes_counter_immediate, false, "GPU",
                     "after the GPU work before it has completed")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 250, "GPU",
+                     "When the command processor has had no commands for this many "
+                     "milliseconds, write the current GPU counter to where the last counter "
+                     "event wrote it, if it has advanced, so a guest polling that counter for a "
+                     "fence can't wait forever for commands it hasn't submitted (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
                      "Host guest-frame swap limit in FPS (0 = unlimited). "
                      "VSync and guest timing may impose a lower rate.")
@@ -341,12 +348,28 @@ void CommandProcessor::WorkerThreadMain() {
       // event is too high.
       PrepareForWait();
       uint32_t loop_count = 0;
+      const auto idle_start = std::chrono::steady_clock::now();
+      auto idle_next_log = idle_start + std::chrono::seconds(3);
       do {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+          // Writes queued after the wait preparation (none expected) and the
+          // periodic diagnostics must not depend on new commands arriving.
+          if (!async_guest_writes_.empty()) {
+            FlushAsyncGuestVisibleWrites(false);
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const int32_t refresh_ms = REXCVAR_GET(gpu_idle_counter_refresh_ms);
+          if (refresh_ms > 0 && now - idle_start >= std::chrono::milliseconds(refresh_ms)) {
+            RefreshCounterWhileIdle();
+          }
+          if (now >= idle_next_log) {
+            LogIdleStall(now - idle_start);
+            idle_next_log = now + std::chrono::seconds(5);
+          }
         }
 
         rex::thread::MaybeYield();
@@ -795,6 +818,44 @@ void CommandProcessor::LogAsyncGuestWriteDiag() {
   async_diag_last_log_ = now;
 }
 
+void CommandProcessor::RefreshCounterWhileIdle() {
+  if (!last_shd_counter_address_) {
+    return;
+  }
+  uint8_t* host_address = memory_->TranslatePhysical(last_shd_counter_address_);
+  uint32_t current =
+      GpuSwap(*reinterpret_cast<const uint32_t*>(host_address), last_shd_counter_endian_);
+  // Only move the counter forward (the guest also writes it).
+  if (int32_t(counter_ - current) <= 0) {
+    return;
+  }
+  *reinterpret_cast<uint32_t*>(host_address) = GpuSwap(counter_, last_shd_counter_endian_);
+  last_shd_counter_value_ = counter_;
+  if (!(idle_counter_refreshes_++ & 63)) {
+    REXGPU_INFO("Command processor idle: refreshed the GPU counter at {:08X} from {} to {} ({} "
+                "times so far)",
+                last_shd_counter_address_, current, counter_, idle_counter_refreshes_);
+  }
+}
+
+void CommandProcessor::LogIdleStall(std::chrono::steady_clock::duration idle_time) {
+  auto load = [this](uint32_t address) -> uint32_t {
+    if (!address) {
+      return 0;
+    }
+    return rex::byte_swap(*reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(address)));
+  };
+  REXGPU_INFO(
+      "Command processor idle for {} ms: counter {}; last counter write {:08X} = {} (now {}); "
+      "last value write {:08X} = {:08X} (now {:08X}); last memory wait {:08X} for {:08X} "
+      "(now {:08X}); {} queued writes",
+      std::chrono::duration_cast<std::chrono::milliseconds>(idle_time).count(), counter_,
+      last_shd_counter_address_, last_shd_counter_value_, load(last_shd_counter_address_),
+      last_shd_value_address_, last_shd_value_value_, load(last_shd_value_address_),
+      last_wait_reg_mem_address_, last_wait_reg_mem_reference_, load(last_wait_reg_mem_address_),
+      async_guest_writes_.size());
+}
+
 bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode,
                                                   uint32_t count, bool* result) {
   if (opcode == PM4_EVENT_WRITE_SHD && REXCVAR_GET(async_guest_writes_counter_immediate)) {
@@ -859,6 +920,14 @@ bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, ui
       WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
       bool is_counter = (initiator >> 31) & 0x1;
       uint32_t data_value = is_counter ? counter_ : value;
+      if (is_counter) {
+        last_shd_counter_address_ = address & ~uint32_t(0x3);
+        last_shd_counter_value_ = data_value;
+        last_shd_counter_endian_ = static_cast<xenos::Endian>(address & 0x3);
+      } else {
+        last_shd_value_address_ = address & ~uint32_t(0x3);
+        last_shd_value_value_ = data_value;
+      }
       auto endianness = static_cast<xenos::Endian>(address & 0x3);
       uint32_t stored;
       memory::store(&stored, GpuSwap(data_value, endianness));
@@ -1286,6 +1355,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  if (is_memory) {
+    last_wait_reg_mem_address_ = poll_reg_addr & ~uint32_t(0x3);
+    last_wait_reg_mem_reference_ = ref;
+  }
 
   bool matched = false;
   bool value_from_queue = false;
@@ -1544,9 +1617,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
     data_value = counter_;
+    last_shd_counter_address_ = address & ~uint32_t(0x3);
+    last_shd_counter_value_ = data_value;
+    last_shd_counter_endian_ = static_cast<xenos::Endian>(address & 0x3);
   } else {
     // Write value.
     data_value = value;
+    last_shd_value_address_ = address & ~uint32_t(0x3);
+    last_shd_value_value_ = data_value;
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
