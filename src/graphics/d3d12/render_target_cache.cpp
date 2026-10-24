@@ -4193,6 +4193,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             new_transfer_shader_key.mode = source_rt_key.is_depth
                                                ? TransferMode::kDepthToStencilBit
                                                : TransferMode::kColorToStencilBit;
+            if (transfer.stencil_unchanged) {
+              // The destination already has this stencil - neither clear nor
+              // write it.
+              diag::stencil_unchanged_transfers.fetch_add(1, std::memory_order_relaxed);
+              continue;
+            }
             stencil_clear_rectangle_count += transfer.GetRectangles(
                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                 nullptr, resolve_clear_rectangle);
@@ -4238,6 +4244,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             stencil_clear_rectangle_count);
         assert_not_null(stencil_clear_rect_write_ptr);
         for (const Transfer& transfer : current_transfers) {
+          if (transfer.stencil_unchanged) {
+            continue;
+          }
           Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,

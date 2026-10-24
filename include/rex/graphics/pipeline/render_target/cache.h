@@ -309,13 +309,19 @@ class RenderTargetCache {
     // Stencil bits that may be non-zero in the transferred range (see
     // OwnershipRange::stencil_bits).
     uint32_t stencil_bits = 0xFF;
+    // The destination (depth) still holds the same stencil as the source in the
+    // range (see OwnershipRange::stencil_clean_source), only depth needs to be
+    // copied.
+    bool stencil_unchanged = false;
     Transfer(uint32_t start_tiles, uint32_t end_tiles, RenderTarget* source,
-             RenderTarget* host_depth_source, uint32_t stencil_bits = 0xFF)
+             RenderTarget* host_depth_source, uint32_t stencil_bits = 0xFF,
+             bool stencil_unchanged = false)
         : start_tiles(start_tiles),
           end_tiles(end_tiles),
           source(source),
           host_depth_source(host_depth_source),
-          stencil_bits(stencil_bits) {
+          stencil_bits(stencil_bits),
+          stencil_unchanged(stencil_unchanged) {
       assert_true(start_tiles < end_tiles);
     }
     struct Rectangle {
@@ -597,6 +603,12 @@ class RenderTargetCache {
     // it. Without stencil output from pixel shaders, transfers to depth copy
     // stencil bit by bit, and only need these bits.
     uint32_t stencil_bits = 0xFF;
+    // A depth render target other than the owner that still holds the same
+    // stencil for this range: like clean_source, but only reset by writes that
+    // may change the stencil (in the depth / stencil interpretation), so depth
+    // switching between MSAA sample counts with only depth written in between
+    // doesn't need to copy the stencil back bit by bit.
+    RenderTargetKey stencil_clean_source;
     OwnershipRange(uint32_t end_tiles, RenderTargetKey render_target,
                    RenderTargetKey host_depth_render_target_unorm24,
                    RenderTargetKey host_depth_render_target_float24)
@@ -635,7 +647,8 @@ class RenderTargetCache {
       return render_target == other_range.render_target &&
              host_depth_render_target_unorm24 == other_range.host_depth_render_target_unorm24 &&
              host_depth_render_target_float24 == other_range.host_depth_render_target_float24 &&
-             clean_source == other_range.clean_source && stencil_bits == other_range.stencil_bits;
+             clean_source == other_range.clean_source && stencil_bits == other_range.stencil_bits &&
+             stencil_clean_source == other_range.stencil_clean_source;
     }
   };
 
@@ -657,9 +670,9 @@ class RenderTargetCache {
   // barrier and addressed by different target-independent rasterization pixel
   // positions.
   // Marks the range as written by its owner, so the previous owner no longer
-  // holds the same data.
+  // holds the same data (and, if `stencil_written`, the same stencil).
   void MarkOwnershipRangeWritten(RenderTargetKey key, uint32_t start_tiles_base_relative,
-                                 uint32_t length_tiles);
+                                 uint32_t length_tiles, bool stencil_written);
   // Adds stencil bits that may be non-zero to the ranges, or with `assign`,
   // sets them for the ranges fully within the extent (completely overwritten).
   void UpdateOwnershipRangeStencilBits(RenderTargetKey key, uint32_t start_tiles_base_relative,
