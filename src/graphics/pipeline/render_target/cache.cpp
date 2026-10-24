@@ -38,6 +38,13 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
+REXCVAR_DEFINE_BOOL(skip_redundant_render_target_transfers, true, "GPU",
+                    "With host render targets, don't transfer EDRAM data back to a render "
+                    "target that still holds it: the range's owner got it from that render "
+                    "target and hasn't written to it since (such as depth switching between "
+                    "1x and 4x MSAA with only depth testing in one of them)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -702,6 +709,22 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     return true;
   }
 
+  // The previous owners of the ranges the draw writes no longer hold the same
+  // data.
+  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+    uint32_t rt_bit_index = edram_bases_sorted[i].second;
+    bool writes;
+    if (rt_bit_index) {
+      writes = ((normalized_color_mask >> ((rt_bit_index - 1) * 4)) & 0xF) != 0;
+    } else {
+      writes = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
+               normalized_depth_control.stencil_enable;
+    }
+    if (writes) {
+      MarkOwnershipRangeWritten(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i]);
+    }
+  }
+
   // If everything succeeded, update the used render targets.
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     last_update_used_render_targets_[i] =
@@ -1121,12 +1144,16 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   if (depth_render_target) {
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
                     depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
+    MarkOwnershipRangeWritten(depth_render_target_key, depth_clear_start_tiles_base_relative,
+                              depth_clear_length_tiles);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
   if (color_render_target) {
     ChangeOwnership(color_render_target_key, color_clear_start_tiles_base_relative,
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
+    MarkOwnershipRangeWritten(color_render_target_key, color_clear_start_tiles_base_relative,
+                              color_clear_length_tiles);
   }
   return true;
 }
@@ -1180,6 +1207,33 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_targets_.emplace(key, render_target);
   }
   return render_target;
+}
+
+void RenderTargetCache::MarkOwnershipRangeWritten(RenderTargetKey key,
+                                                  uint32_t start_tiles_base_relative,
+                                                  uint32_t length_tiles) {
+  if (!length_tiles) {
+    return;
+  }
+  auto mark_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+    auto it = ownership_ranges_.lower_bound(extent_start);
+    if (it != ownership_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != ownership_ranges_.end() && it->first < extent_end; ++it) {
+      // Conservatively for the whole range even if it's partially outside.
+      it->second.clean_source = RenderTargetKey();
+    }
+  };
+  uint32_t start_tiles = (key.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  mark_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    mark_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
 }
 
 bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
@@ -1301,10 +1355,21 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // Only perform the copying when actually changing the latest owner, not
         // just the latest host depth owner - the transfer source is expected to
         // be different than the destination.
+        bool transfer_redundant = false;
         if (!transfer_source.IsEmpty() && transfer_source != dest) {
           uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
-          diag::RecordTransfer(transfer_source.key, dest.key, transfer_end_tiles - it->first);
-          if (!resolve_clear_cutout ||
+          if (it->second.clean_source == dest) {
+            // The destination still holds this data from when it gave the
+            // range to the current owner, which hasn't written to it since.
+            diag::redundant_transfer_tiles.fetch_add(transfer_end_tiles - it->first,
+                                                     std::memory_order_relaxed);
+            transfer_redundant = REXCVAR_GET(skip_redundant_render_target_transfers);
+          }
+          if (!transfer_redundant) {
+            diag::RecordTransfer(transfer_source.key, dest.key, transfer_end_tiles - it->first);
+          }
+          if (transfer_redundant) {
+          } else if (!resolve_clear_cutout ||
               Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
                                            dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
                                            nullptr, resolve_clear_cutout)) {
@@ -1351,6 +1416,16 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         }
       }
       // Claim the current range.
+      if (transfers_append_out) {
+        RenderTargetKey previous_owner = it->second.render_target;
+        if (previous_owner != dest) {
+          // The previous owner keeps the data that is now in the destination
+          // (transferred, or already there).
+          it->second.clean_source = previous_owner;
+        }
+      } else {
+        it->second.clean_source = RenderTargetKey();
+      }
       it->second.render_target = dest;
       if (host_depth_encoding_different) {
         it->second.GetHostDepthRenderTarget(dest.GetDepthFormat()) = dest;

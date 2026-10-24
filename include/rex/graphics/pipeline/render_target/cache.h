@@ -598,6 +598,11 @@ class RenderTargetCache {
     // empty too.
     RenderTargetKey host_depth_render_target_unorm24;
     RenderTargetKey host_depth_render_target_float24;
+    // A render target other than the owner that still holds the same data for
+    // this range: the one the owner got it from, if the owner hasn't written
+    // to the range since then. Taking the ownership back to it then doesn't
+    // need a transfer (with host render targets).
+    RenderTargetKey clean_source;
     OwnershipRange(uint32_t end_tiles, RenderTargetKey render_target,
                    RenderTargetKey host_depth_render_target_unorm24,
                    RenderTargetKey host_depth_render_target_float24)
@@ -635,7 +640,8 @@ class RenderTargetCache {
     bool AreOwnersSame(const OwnershipRange& other_range) const {
       return render_target == other_range.render_target &&
              host_depth_render_target_unorm24 == other_range.host_depth_render_target_unorm24 &&
-             host_depth_render_target_float24 == other_range.host_depth_render_target_float24;
+             host_depth_render_target_float24 == other_range.host_depth_render_target_float24 &&
+             clean_source == other_range.clean_source;
     }
   };
 
@@ -656,6 +662,10 @@ class RenderTargetCache {
   // barriers are still needed before accessing ranges written before the
   // barrier and addressed by different target-independent rasterization pixel
   // positions.
+  // Marks the range as written by its owner, so the previous owner no longer
+  // holds the same data.
+  void MarkOwnershipRangeWritten(RenderTargetKey key, uint32_t start_tiles_base_relative,
+                                 uint32_t length_tiles);
   bool WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
                                             uint32_t start_tiles_base_relative,
                                             uint32_t length_tiles) const;
