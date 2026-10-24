@@ -60,8 +60,8 @@ inline void RecordTransfer(uint32_t source_key, uint32_t dest_key, uint32_t tile
 // Formats the format names of a key without the base and the pitch, set by the
 // render target cache.
 inline std::string (*describe_render_target_key)(uint32_t key_without_base_pitch) = nullptr;
-// Depth transfers needing the stencil copied bit by bit (8 draws), done and
-// skipped because the source's stencil was known to be zero.
+// Stencil bit draws of depth transfers (8 per transfer without stencil
+// reference output), done and skipped because the bit is zero in the source.
 inline std::atomic<uint64_t> stencil_bit_transfers{0};
 inline std::atomic<uint64_t> stencil_bit_transfers_skipped{0};
 // EDRAM tiles of transfers back to a render target still holding the data.
@@ -73,7 +73,7 @@ inline std::string TakeTransferSummary() {
   std::sort(entries.begin(), entries.end(),
             [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
   std::string result =
-      fmt::format("stencil bit-by-bit transfers {} done, {} skipped; redundant transfers {} "
+      fmt::format("stencil bit draws {} done, {} skipped; redundant transfers {} "
                   "tiles; render target transfers by EDRAM tiles:",
                   stencil_bit_transfers.exchange(0), stencil_bit_transfers_skipped.exchange(0),
                   redundant_transfer_tiles.exchange(0));

@@ -294,20 +294,20 @@ class RenderTargetCache {
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
 
-    // Whether the stencil of a depth render target may contain anything other
-    // than zeros (written by a draw with stencil enabled, a non-zero clear, or
-    // a transfer from a source that may have non-zero stencil). Transfers from
-    // a depth render target without stencil data don't need to copy the
-    // stencil bit by bit when the host can't output stencil from shaders.
-    bool stencil_maybe_nonzero() const { return stencil_maybe_nonzero_; }
-    void SetStencilMaybeNonzero() { stencil_maybe_nonzero_ = true; }
+    // Stencil bits of a depth render target that may be non-zero anywhere in
+    // it (the write masks of draws with stencil enabled, non-zero bits of
+    // clears, and the bits of transfer sources). Transfers from a depth render
+    // target only need to copy these bits when the host can't output stencil
+    // from shaders and has to copy it bit by bit.
+    uint32_t stencil_maybe_nonzero_bits() const { return stencil_maybe_nonzero_bits_; }
+    void AddStencilMaybeNonzeroBits(uint32_t bits) { stencil_maybe_nonzero_bits_ |= bits & 0xFF; }
 
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
 
    private:
     RenderTargetKey key_;
-    bool stencil_maybe_nonzero_ = false;
+    uint32_t stencil_maybe_nonzero_bits_ = 0;
   };
 
  public:
