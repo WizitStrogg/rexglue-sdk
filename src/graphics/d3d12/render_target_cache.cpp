@@ -4463,6 +4463,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             stencil_clear_rectangle_count += transfer.GetRectangles(
                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                 nullptr, resolve_clear_rectangle);
+            diag::RecordStencilTransferBits(transfer.stencil_bits,
+                                            transfer.end_tiles - transfer.start_tiles);
             if (!transfer.stencil_bits && REXCVAR_GET(d3d12_skip_zero_stencil_transfers)) {
               // The stencil is all zeros in the range - clearing the
               // destination's stencil is enough, no need for the bit draws.

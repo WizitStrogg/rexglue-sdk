@@ -83,6 +83,15 @@ inline void RecordStencilTransfer(uint32_t reason, uint32_t tiles) {
 }
 // Draws to depth that may change the stencil.
 inline std::atomic<uint64_t> stencil_write_draws{0};
+// Draws with depth bound by [1x, 4x MSAA][stencil disabled, read only, writes].
+inline std::atomic<uint64_t> depth_draws_by_stencil_use[2][3];
+// OR of the stencil bits draws may set.
+inline std::atomic<uint32_t> draw_stencil_bits_or{0};
+// EDRAM tiles of depth transfers needing stencil bit draws by the stencil bits.
+inline std::atomic<uint64_t> stencil_transfer_tiles_by_bits[256];
+inline void RecordStencilTransferBits(uint32_t bits, uint32_t tiles) {
+  stencil_transfer_tiles_by_bits[bits & 0xFF].fetch_add(tiles, std::memory_order_relaxed);
+}
 // EDRAM tiles of transfers back to a render target still holding the data.
 inline std::atomic<uint64_t> redundant_transfer_tiles{0};
 inline std::string TakeTransferSummary() {
@@ -96,7 +105,29 @@ inline std::string TakeTransferSummary() {
   for (auto& reason_tiles : stencil_transfer_tiles_by_reason) {
     result += fmt::format(" {}", reason_tiles.exchange(0));
   }
-  result += fmt::format("; stencil-writing draws {}; ", stencil_write_draws.exchange(0));
+  result += fmt::format("; stencil-writing draws {}", stencil_write_draws.exchange(0));
+  result += "; depth draws 1x/4x by stencil (off/read/write):";
+  for (auto& msaa_draws : depth_draws_by_stencil_use) {
+    result += fmt::format(" {}/{}/{}", msaa_draws[0].exchange(0), msaa_draws[1].exchange(0),
+                          msaa_draws[2].exchange(0));
+  }
+  result += fmt::format("; draw stencil bits OR {:02X}; stencil transfer tiles by bits:",
+                        draw_stencil_bits_or.exchange(0));
+  {
+    std::vector<std::pair<uint64_t, uint32_t>> bits_tiles;
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint64_t tiles = stencil_transfer_tiles_by_bits[i].exchange(0);
+      if (tiles) {
+        bits_tiles.emplace_back(tiles, i);
+      }
+    }
+    std::sort(bits_tiles.begin(), bits_tiles.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = 0; i < std::min(bits_tiles.size(), size_t(8)); ++i) {
+      result += fmt::format(" {:02X}:{}", bits_tiles[i].second, bits_tiles[i].first);
+    }
+  }
+  result += "; ";
   result +=
       fmt::format("stencil bit draws {} done, {} skipped; stencil kept in {} transfers; "
                   "redundant transfers {} tiles; render target transfers by EDRAM tiles:",
