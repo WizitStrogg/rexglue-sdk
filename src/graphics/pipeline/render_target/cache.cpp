@@ -21,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -334,6 +335,12 @@ RenderTargetCache::~RenderTargetCache() {
 }
 
 void RenderTargetCache::InitializeCommon() {
+  diag::describe_render_target_key = [](uint32_t key_without_base_pitch) -> std::string {
+    RenderTargetKey key;
+    key.key = key_without_base_pitch << 19;
+    return fmt::format("{}{} {}x", key.is_depth ? "depth " : "", key.GetFormatName(),
+                       uint32_t(1) << uint32_t(key.msaa_samples));
+  };
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -1296,6 +1303,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // be different than the destination.
         if (!transfer_source.IsEmpty() && transfer_source != dest) {
           uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
+          diag::RecordTransfer(transfer_source.key, dest.key, transfer_end_tiles - it->first);
           if (!resolve_clear_cutout ||
               Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
                                            dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
