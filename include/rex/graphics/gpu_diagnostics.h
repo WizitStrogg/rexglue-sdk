@@ -6,7 +6,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -42,6 +46,38 @@ inline std::atomic<uint64_t> cp_gpu_wait_us{0};
 inline std::atomic<uint64_t> submission_thread_us{0};
 inline std::atomic<uint64_t> submission_thread_flush_us{0};
 
+// Render target ownership transfers (EDRAM data copied between host render
+// targets): count and EDRAM tiles, by source and destination render target
+// (key bits other than the base and the pitch). Command processor thread only.
+inline std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> transfer_stats;
+inline void RecordTransfer(uint32_t source_key, uint32_t dest_key, uint32_t tiles) {
+  // Drop the EDRAM base (11 bits) and the pitch (8 bits).
+  uint64_t key = (uint64_t(source_key >> 19) << 32) | (dest_key >> 19);
+  auto& stats = transfer_stats[key];
+  ++stats.first;
+  stats.second += tiles;
+}
+// Formats the format names of a key without the base and the pitch, set by the
+// render target cache.
+inline std::string (*describe_render_target_key)(uint32_t key_without_base_pitch) = nullptr;
+inline std::string TakeTransferSummary() {
+  std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> entries(transfer_stats.begin(),
+                                                                          transfer_stats.end());
+  transfer_stats.clear();
+  std::sort(entries.begin(), entries.end(),
+            [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+  std::string result = "render target transfers by EDRAM tiles:";
+  for (size_t i = 0; i < std::min(entries.size(), size_t(8)); ++i) {
+    uint32_t source = uint32_t(entries[i].first >> 32);
+    uint32_t dest = uint32_t(entries[i].first);
+    result += fmt::format(" [{} -> {}: {} transfers, {} tiles]",
+                          describe_render_target_key ? describe_render_target_key(source) : "?",
+                          describe_render_target_key ? describe_render_target_key(dest) : "?",
+                          entries[i].second.first, entries[i].second.second);
+  }
+  return result;
+}
+
 inline std::string TakeSummary() {
   return fmt::format(
       "memexport {} draws / {} KB, readback {} KB, CPU writes to GPU-written pages {}, merged "
@@ -57,7 +93,8 @@ inline std::string TakeSummary() {
       gpu_category_us[size_t(GpuCategory::kTextureLoads)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kResolves)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kMemoryUploads)].exchange(0) / 1000,
-      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000);
+      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000) +
+         "; " + TakeTransferSummary();
 }
 
 }  // namespace rex::graphics::diag
