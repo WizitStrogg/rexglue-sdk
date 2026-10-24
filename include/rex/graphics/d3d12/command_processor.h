@@ -658,6 +658,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
+  // GPU timestamps at the beginning and the end of each submission, for
+  // measuring host GPU time (gpu_diagnostics.h).
+  static constexpr uint32_t kTimestampSubmissionSlots = 256;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
+  const uint64_t* timestamp_readback_mapping_ = nullptr;
+  uint64_t timestamp_frequency_ = 0;
+  uint64_t timestamp_slot_submission_[kTimestampSubmissionSlots] = {};
+  void InitializeTimestampResources();
+  void ShutdownTimestampResources();
+  void CollectTimestamps(uint64_t completed_before, uint64_t completed_now);
+
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;

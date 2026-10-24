@@ -21,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -1642,6 +1643,7 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  InitializeTimestampResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1661,6 +1663,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   async_readback_buffers_.clear();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  ShutdownTimestampResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -2750,6 +2753,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
+    diag::memexport_draws.fetch_add(1, std::memory_order_relaxed);
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      diag::memexport_bytes.fetch_add(memexport_range.size_bytes, std::memory_order_relaxed);
+    }
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
         !memexport_ranges_.empty()) {
       uint32_t memexport_total_size = 0;
@@ -2843,6 +2850,7 @@ uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
     readback = &async_readback_buffers_.back();
   }
   readback->in_use = true;
+  diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
   size_t readback_index = size_t(readback - async_readback_buffers_.data());
 
   shared_memory_->UseAsCopySource();
@@ -2895,6 +2903,7 @@ bool D3D12CommandProcessor::MemexportReadbackFullPath(
   if (!readback_buffer) {
     return true;
   }
+  diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
 
   shared_memory_->UseAsCopySource();
   SubmitBarriers();
@@ -3305,7 +3314,13 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
+      const auto wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      diag::cp_gpu_wait_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count()),
+          std::memory_order_relaxed);
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3316,6 +3331,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // Not updated - no need to reclaim or download things.
     return;
   }
+
+  CollectTimestamps(submission_completed_before, submission_completed_);
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -3471,6 +3488,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // fulfilled).
     deferred_command_list_.Reset();
 
+    if (timestamp_query_heap_) {
+      uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                         slot * 2);
+      timestamp_slot_submission_[slot] = submission_current_;
+    }
+
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3581,6 +3605,17 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.
     SubmitBarriers();
+
+    if (timestamp_query_heap_) {
+      uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                         slot * 2 + 1);
+      deferred_command_list_.D3DResolveQueryData(timestamp_query_heap_.Get(),
+                                                 D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2,
+                                                 timestamp_readback_.Get(),
+                                                 sizeof(uint64_t) * slot * 2);
+    }
+    diag::submissions.fetch_add(1, std::memory_order_relaxed);
 
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
@@ -5042,6 +5077,69 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
   occlusion_query_resources_available_ = true;
   return true;
+}
+
+void D3D12CommandProcessor::InitializeTimestampResources() {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !direct_queue || FAILED(direct_queue->GetTimestampFrequency(&timestamp_frequency_)) ||
+      !timestamp_frequency_) {
+    return;
+  }
+  D3D12_QUERY_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count = kTimestampSubmissionSlots * 2;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&timestamp_query_heap_)))) {
+    return;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, sizeof(uint64_t) * kTimestampSubmissionSlots * 2, D3D12_RESOURCE_FLAG_NONE);
+  void* mapping = nullptr;
+  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kTimestampSubmissionSlots * 2};
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&timestamp_readback_))) ||
+      FAILED(timestamp_readback_->Map(0, &read_range, &mapping))) {
+    timestamp_readback_.Reset();
+    timestamp_query_heap_.Reset();
+    return;
+  }
+  timestamp_readback_mapping_ = static_cast<const uint64_t*>(mapping);
+  std::memset(timestamp_slot_submission_, 0, sizeof(timestamp_slot_submission_));
+}
+
+void D3D12CommandProcessor::ShutdownTimestampResources() {
+  if (timestamp_readback_ && timestamp_readback_mapping_) {
+    timestamp_readback_->Unmap(0, nullptr);
+  }
+  timestamp_readback_mapping_ = nullptr;
+  timestamp_readback_.Reset();
+  timestamp_query_heap_.Reset();
+}
+
+void D3D12CommandProcessor::CollectTimestamps(uint64_t completed_before, uint64_t completed_now) {
+  if (!timestamp_readback_mapping_ || completed_now <= completed_before) {
+    return;
+  }
+  uint64_t first = std::max(completed_before + 1, completed_now >= kTimestampSubmissionSlots
+                                                      ? completed_now - kTimestampSubmissionSlots + 1
+                                                      : uint64_t(1));
+  uint64_t busy_ticks = 0;
+  for (uint64_t submission = first; submission <= completed_now; ++submission) {
+    uint32_t slot = uint32_t(submission % kTimestampSubmissionSlots);
+    if (timestamp_slot_submission_[slot] != submission) {
+      continue;
+    }
+    uint64_t begin = timestamp_readback_mapping_[slot * 2];
+    uint64_t end = timestamp_readback_mapping_[slot * 2 + 1];
+    if (end > begin) {
+      busy_ticks += end - begin;
+    }
+  }
+  diag::gpu_busy_us.fetch_add(busy_ticks * 1000000 / timestamp_frequency_,
+                              std::memory_order_relaxed);
 }
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {

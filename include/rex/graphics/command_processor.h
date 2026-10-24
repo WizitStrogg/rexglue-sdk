@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -185,7 +186,8 @@ class CommandProcessor {
   virtual bool IsAsyncGuestVisibleWriteReady(uint64_t /* token */, bool /* wait */) {
     return true;
   }
-  void QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write);
+  void QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write,
+                                   std::vector<std::pair<uint32_t, uint32_t>> stores = {});
   // Does the queued writes whose GPU work has completed (or all, waiting for
   // the GPU, if `wait` is true).
   void FlushAsyncGuestVisibleWrites(bool wait);
@@ -283,9 +285,31 @@ class CommandProcessor {
   struct AsyncGuestVisibleWrite {
     uint64_t token;
     std::function<void()> write;
+    // Memory words the write stores (physical address of the dword, value as
+    // stored in memory), so command processor waits can see them early, as
+    // the GPU would have written them by then.
+    std::vector<std::pair<uint32_t, uint32_t>> stores;
   };
+  // Returns the value of a memory dword as the GPU sees it at this point of
+  // the command stream, including queued asynchronous writes.
+  uint32_t LoadMemoryForGpu(uint32_t physical_address_dword, bool* from_queue = nullptr) const;
   std::deque<AsyncGuestVisibleWrite> async_guest_writes_;
   uint32_t async_guest_writes_poll_counter_ = 0;
+  // Diagnostic counts of guest-visible packets, logged every few seconds.
+  struct AsyncGuestWriteDiag {
+    uint64_t interrupts = 0;
+    uint64_t mem_writes = 0;
+    uint64_t counter_events = 0;
+    uint64_t value_events = 0;
+    uint64_t counter_immediate = 0;
+    uint64_t immediate = 0;
+    uint64_t drains = 0;
+    uint64_t wait_queue_hits = 0;
+    uint64_t wait_drains = 0;
+    uint64_t swaps = 0;
+  } async_diag_;
+  std::chrono::steady_clock::time_point async_diag_last_log_ = std::chrono::steady_clock::now();
+  void LogAsyncGuestWriteDiag();
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
