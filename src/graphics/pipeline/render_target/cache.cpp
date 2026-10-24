@@ -781,7 +781,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       writes_stencil = draw_writes_stencil;
       if (draw_writes_stencil) {
         diag::stencil_write_draws.fetch_add(1, std::memory_order_relaxed);
+        diag::draw_stencil_bits_or.fetch_or(draw_stencil_bits, std::memory_order_relaxed);
       }
+      diag::depth_draws_by_stencil_use
+          [rt_keys[rt_bit_index].msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0]
+          [draw_writes_stencil ? 2 : (normalized_depth_control.stencil_enable ? 1 : 0)]
+              .fetch_add(1, std::memory_order_relaxed);
       if (draw_stencil_bits) {
         UpdateOwnershipRangeStencilBits(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                                         draw_stencil_bits, false);
