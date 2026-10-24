@@ -61,6 +61,12 @@ REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_pixel_rate, true, "GPU/D3D12",
                     "of once per sample.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_pack, true, "GPU/D3D12",
+                    "Without native stencil value output, in render target transfers to 1x and 4x "
+                    "MSAA depth, compute the stencil once into a scratch texture and do the "
+                    "bit-by-bit stencil draws from it instead of computing it in every bit draw.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil, true, "GPU/D3D12",
                     "Experimental: false skips copying the stencil in depth render target "
                     "transfers without native stencil value output, leaving the destination's "
@@ -1016,6 +1022,16 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_color_);
 
+  ui::d3d12::util::ReleaseAndNull(stencil_pack_texture_);
+  for (ID3D12Resource* retired_texture : stencil_pack_retired_textures_) {
+    retired_texture->Release();
+  }
+  stencil_pack_retired_textures_.clear();
+  stencil_pack_texture_width_ = 0;
+  stencil_pack_texture_height_ = 0;
+  ui::d3d12::util::ReleaseAndNull(stencil_pack_srv_heap_);
+  ui::d3d12::util::ReleaseAndNull(stencil_pack_rtv_heap_);
+
   for (const auto& transfer_pipeline_array_pair : transfer_stencil_bit_pipelines_) {
     for (ID3D12PipelineState* transfer_pipeline : transfer_pipeline_array_pair.second) {
       if (transfer_pipeline) {
@@ -1780,12 +1796,24 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   bool dest_is_stencil_bit = (mode.output == TransferOutput::kStencilBit);
   // Writing stencil bits to all 4 samples of a pixel in one pixel-rate
   // invocation through the coverage output rather than in 4 sample-rate ones.
-  bool dest_sample_loop = dest_is_stencil_bit && key.dest_msaa_samples == xenos::MsaaSamples::k4X &&
-                          REXCVAR_GET(d3d12_transfer_stencil_pixel_rate);
-  bool shader_reads_sample_index =
-      key.dest_msaa_samples != xenos::MsaaSamples::k1X && !dest_sample_loop;
+  // With the stencil pack texture, either writing the stencil of the samples
+  // to it, or doing the bit draws from it.
+  bool stencil_pack_writes =
+      dest_is_stencil_bit && key.stencil_pack_stage == kTransferStencilPackStagePack;
+  bool stencil_from_pack =
+      dest_is_stencil_bit && key.stencil_pack_stage == kTransferStencilPackStageBits;
+  assert_true(key.stencil_pack_stage == kTransferStencilPackStageNone ||
+              key.dest_msaa_samples == xenos::MsaaSamples::k1X ||
+              key.dest_msaa_samples == xenos::MsaaSamples::k4X);
+  bool dest_sample_loop = stencil_pack_writes ||
+                          (dest_is_stencil_bit && !stencil_from_pack &&
+                           key.dest_msaa_samples == xenos::MsaaSamples::k4X &&
+                           REXCVAR_GET(d3d12_transfer_stencil_pixel_rate));
+  uint32_t dest_sample_loop_count = key.dest_msaa_samples == xenos::MsaaSamples::k4X ? 4 : 1;
+  bool shader_reads_sample_index = key.dest_msaa_samples != xenos::MsaaSamples::k1X &&
+                                   !dest_sample_loop && !stencil_from_pack;
 
-  if (dest_is_stencil_bit) {
+  if (dest_is_stencil_bit && !stencil_pack_writes) {
     auto pipelines_it = transfer_stencil_bit_pipelines_.find(key);
     if (pipelines_it != transfer_stencil_bit_pipelines_.end()) {
       return pipelines_it->second[0] ? pipelines_it->second.data() : nullptr;
@@ -2277,13 +2305,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Color or depth.
   uint32_t osgn_parameter_count = 0;
   uint32_t osgn_parameter_index_sv_target =
-      mode.output == TransferOutput::kColor ? osgn_parameter_count++ : UINT32_MAX;
+      (mode.output == TransferOutput::kColor || stencil_pack_writes) ? osgn_parameter_count++
+                                                                     : UINT32_MAX;
   uint32_t osgn_parameter_index_sv_depth =
       mode.output == TransferOutput::kDepth ? osgn_parameter_count++ : UINT32_MAX;
   uint32_t osgn_parameter_index_sv_stencil_ref =
       shader_uses_stencil_reference_output ? osgn_parameter_count++ : UINT32_MAX;
   uint32_t osgn_parameter_index_sv_coverage =
-      dest_sample_loop ? osgn_parameter_count++ : UINT32_MAX;
+      ((dest_sample_loop && !stencil_pack_writes) || stencil_from_pack) ? osgn_parameter_count++
+                                                                        : UINT32_MAX;
 
   // Reserve space for the header and the parameters.
   built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
@@ -2314,7 +2344,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   if (mode.output == TransferOutput::kColor) {
     GetColorOwnershipTransferDXGIFormat(dest_color_format, &dest_color_is_uint);
   } else {
-    dest_color_is_uint = false;
+    // The stencil pack texture is R32_UINT.
+    dest_color_is_uint = stencil_pack_writes;
   }
 
   // Header and parameters.
@@ -2478,7 +2509,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
 
   if (dest_sample_loop) {
-    // r3.x = coverage of the samples with the stencil bit set.
+    // r3.x = coverage of the samples with the stencil bit set, or the stencil
+    // of the samples, a byte per sample, for the stencil pack texture.
     a.OpMov(dxbc::Dest::R(3, 0b0001), dxbc::Src::LU(0));
   }
   // Emits the code for one destination sample (the sample from SV_SampleIndex,
@@ -3629,6 +3661,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           break;
         case TransferOutput::kStencilBit:
           // Discard the sample if the needed stencil bit is not set.
+          if (stencil_pack_writes) {
+            // Only the low 8 bits are the stencil in the depth / stencil
+            // interpretation.
+            a.OpBFI(dxbc::Dest::R(3, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(8 * loop_sample),
+                    dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(3, dxbc::Src::kXXXX));
+            break;
+          }
           assert_true(cbuffer_index_stencil_mask != UINT32_MAX);
           a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
                   dxbc::Src::CB(cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask, 0,
@@ -3646,12 +3685,42 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       }
     }
   };
-  if (dest_sample_loop) {
-    for (uint32_t i = 0; i < 4; ++i) {
+  if (stencil_from_pack) {
+    // r0.xy = pixel XY as uint, r0.z = LOD.
+    a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
+    a.OpMov(dxbc::Dest::R(0, 0b0100), dxbc::Src::LU(0));
+    // r1.x = stencil of the samples, a byte per sample.
+    assert_true(srv_index_stencil != UINT32_MAX);
+    a.OpLd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, 0b10000100), 0b1011,
+           dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kXXXX));
+    // r1 = the needed bit of each sample.
+    uint32_t sample_mask = (uint32_t(1) << dest_sample_loop_count) - 1;
+    a.OpUBFE(dxbc::Dest::R(1, sample_mask), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+             dxbc::Src::R(1, dxbc::Src::kXXXX));
+    assert_true(cbuffer_index_stencil_mask != UINT32_MAX);
+    a.OpAnd(dxbc::Dest::R(1, sample_mask), dxbc::Src::R(1),
+            dxbc::Src::CB(cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask, 0,
+                          dxbc::Src::kXXXX));
+    // r1 = the coverage bits of the samples with the bit set.
+    a.OpMovC(dxbc::Dest::R(1, sample_mask), dxbc::Src::R(1), dxbc::Src::LU(1, 2, 4, 8),
+             dxbc::Src::LU(0));
+    if (dest_sample_loop_count > 1) {
+      a.OpOr(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(1), dxbc::Src::R(1, 0b1110));
+      a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+             dxbc::Src::R(1, dxbc::Src::kYYYY));
+    }
+    a.OpMov(dxbc::Dest::OMask(), dxbc::Src::R(1, dxbc::Src::kXXXX));
+  } else if (dest_sample_loop) {
+    for (uint32_t i = 0; i < dest_sample_loop_count; ++i) {
       emit_sample(dxbc::Src::LU(i), i);
     }
-    // Samples with the bit not set keep their stencil (zero after the clear).
-    a.OpMov(dxbc::Dest::OMask(), dxbc::Src::R(3, dxbc::Src::kXXXX));
+    if (stencil_pack_writes) {
+      a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(3, dxbc::Src::kXXXX));
+    } else {
+      // Samples with the bit not set keep their stencil (zero after the
+      // clear).
+      a.OpMov(dxbc::Dest::OMask(), dxbc::Src::R(3, dxbc::Src::kXXXX));
+    }
   } else {
     emit_sample(dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX), 0);
   }
@@ -3769,7 +3838,24 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   pipeline_desc.InputLayout.pInputElementDescs = &pipeline_input_element_desc;
   pipeline_desc.InputLayout.NumElements = 1;
   pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  if (dest_is_stencil_bit) {
+  if (stencil_pack_writes) {
+    pipeline_desc.SampleMask = UINT_MAX;
+    pipeline_desc.SampleDesc.Count = 1;
+    pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+    pipeline_desc.NumRenderTargets = 1;
+    pipeline_desc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+    ID3D12PipelineState* pipeline;
+    if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(&pipeline)))) {
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create a stencil pack transfer pipeline");
+      pipeline = nullptr;
+    }
+    // Even if creation fails, still store the null pointer not to try to create
+    // again.
+    pipelines = &transfer_pipelines_.emplace(key, pipeline).first->second;
+    if (!pipeline) {
+      pipelines = nullptr;
+    }
+  } else if (dest_is_stencil_bit) {
     pipeline_desc.DepthStencilState.StencilEnable = TRUE;
     pipeline_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
     pipeline_desc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
@@ -3867,6 +3953,78 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
   }
   return pipelines;
+}
+
+bool D3D12RenderTargetCache::EnsureStencilPackTexture(uint32_t width, uint32_t height) {
+  if (stencil_pack_texture_ && stencil_pack_texture_width_ >= width &&
+      stencil_pack_texture_height_ >= height) {
+    return true;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!stencil_pack_rtv_heap_) {
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.NumDescriptors = 1;
+    if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&stencil_pack_rtv_heap_)))) {
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the stencil pack RTV heap");
+      return false;
+    }
+  }
+  if (!stencil_pack_srv_heap_) {
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = 1;
+    if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&stencil_pack_srv_heap_)))) {
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the stencil pack SRV heap");
+      return false;
+    }
+  }
+  // Grow in steps not to recreate often.
+  uint32_t new_width = std::max(width, stencil_pack_texture_width_);
+  uint32_t new_height = std::max(height, stencil_pack_texture_height_);
+  D3D12_RESOURCE_DESC texture_desc = {};
+  texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture_desc.Width = new_width;
+  texture_desc.Height = new_height;
+  texture_desc.DepthOrArraySize = 1;
+  texture_desc.MipLevels = 1;
+  texture_desc.Format = DXGI_FORMAT_R32_UINT;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  ID3D12Resource* new_texture;
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                             D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                             IID_PPV_ARGS(&new_texture)))) {
+    REXGPU_ERROR("D3D12RenderTargetCache: Failed to create a {}x{} stencil pack texture",
+                 new_width, new_height);
+    return false;
+  }
+  new_texture->SetName(L"Stencil Pack Texture");
+  if (stencil_pack_texture_) {
+    // May still be used by the GPU.
+    stencil_pack_retired_textures_.push_back(stencil_pack_texture_);
+  }
+  stencil_pack_texture_ = new_texture;
+  stencil_pack_texture_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  stencil_pack_texture_width_ = new_width;
+  stencil_pack_texture_height_ = new_height;
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = DXGI_FORMAT_R32_UINT;
+  rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  device->CreateRenderTargetView(stencil_pack_texture_, &rtv_desc,
+                                 stencil_pack_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = DXGI_FORMAT_R32_UINT;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Texture2D.MipLevels = 1;
+  device->CreateShaderResourceView(stencil_pack_texture_, &srv_desc,
+                                   stencil_pack_srv_heap_->GetCPUDescriptorHandleForHeapStart());
+  REXGPU_DEBUG("D3D12RenderTargetCache: Created a {}x{} stencil pack texture", new_width,
+               new_height);
+  return true;
 }
 
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
@@ -4138,6 +4296,33 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
     }
   }
+  // The stencil pack texture for stencil bit draws to depth.
+  uint32_t stencil_pack_srv_index = UINT32_MAX;
+  if (!use_stencil_reference_output_ && REXCVAR_GET(d3d12_transfer_stencil) &&
+      REXCVAR_GET(d3d12_transfer_stencil_pack)) {
+    uint32_t stencil_pack_width = 0, stencil_pack_height = 0;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      RenderTarget* dest_rt = render_targets[i];
+      if (!dest_rt || render_target_transfers[i].empty()) {
+        continue;
+      }
+      RenderTargetKey dest_rt_key = dest_rt->key();
+      if (!dest_rt_key.is_depth || (dest_rt_key.msaa_samples != xenos::MsaaSamples::k1X &&
+                                    dest_rt_key.msaa_samples != xenos::MsaaSamples::k4X)) {
+        continue;
+      }
+      D3D12_RESOURCE_DESC dest_desc =
+          static_cast<D3D12RenderTarget*>(dest_rt)->resource()->GetDesc();
+      stencil_pack_width = std::max(stencil_pack_width, uint32_t(dest_desc.Width));
+      stencil_pack_height = std::max(stencil_pack_height, uint32_t(dest_desc.Height));
+    }
+    if (stencil_pack_width && stencil_pack_height &&
+        EnsureStencilPackTexture(stencil_pack_width, stencil_pack_height)) {
+      stencil_pack_srv_index = uint32_t(current_temporary_descriptors_cpu_.size());
+      current_temporary_descriptors_cpu_.push_back(
+          stencil_pack_srv_heap_->GetCPUDescriptorHandleForHeapStart());
+    }
+  }
   uint32_t descriptor_count = uint32_t(current_temporary_descriptors_cpu_.size());
   current_temporary_descriptors_gpu_.resize(descriptor_count);
   if (!command_processor_.RequestOneUseSingleViewDescriptors(
@@ -4258,10 +4443,16 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               (host_depth_source_d3d12_rt && !host_depth_source_is_copy)
                   ? host_depth_source_d3d12_rt->key().msaa_samples
                   : xenos::MsaaSamples::k1X;
+          new_transfer_shader_key.stencil_pack_stage = kTransferStencilPackStageNone;
           if (j) {
             new_transfer_shader_key.mode = source_rt_key.is_depth
                                                ? TransferMode::kDepthToStencilBit
                                                : TransferMode::kColorToStencilBit;
+            if (stencil_pack_srv_index != UINT32_MAX &&
+                (dest_rt_key.msaa_samples == xenos::MsaaSamples::k1X ||
+                 dest_rt_key.msaa_samples == xenos::MsaaSamples::k4X)) {
+              new_transfer_shader_key.stencil_pack_stage = kTransferStencilPackStagePack;
+            }
             if (transfer.stencil_unchanged) {
               // The destination already has this stencil - neither clear nor
               // write it.
@@ -4653,6 +4844,77 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                                               diag::GpuCategory::kTransferBarriers);
         D3D12CommandProcessor::GpuProfileScope draws_profile_scope =
             command_processor_.BeginGpuProfileScope();
+        if (is_stencil_bit &&
+            transfer_shader_key.stencil_pack_stage == kTransferStencilPackStagePack) {
+          assert_true(stencil_pack_srv_index != UINT32_MAX);
+          // Write the stencil of the samples to the stencil pack texture.
+          if (stencil_pack_texture_state_ != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            command_processor_.PushTransitionBarrier(stencil_pack_texture_,
+                                                     stencil_pack_texture_state_,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET);
+            stencil_pack_texture_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          }
+          D3D12_CPU_DESCRIPTOR_HANDLE stencil_pack_rtv =
+              stencil_pack_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+          command_list.D3DOMSetRenderTargets(1, &stencil_pack_rtv, FALSE, nullptr);
+          command_processor_.SubmitBarriers();
+          command_processor_.SetExternalPipeline(transfer_pipelines[0]);
+          command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+          // Draw the stencil bits from it.
+          command_processor_.PushTransitionBarrier(
+              stencil_pack_texture_, stencil_pack_texture_state_,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+          stencil_pack_texture_state_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          D3D12_CPU_DESCRIPTOR_HANDLE dest_dsv = dest_d3d12_rt.descriptor_draw().GetHandle();
+          command_list.D3DOMSetRenderTargets(0, nullptr, FALSE, &dest_dsv);
+          TransferShaderKey stencil_bits_shader_key;
+          stencil_bits_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
+          stencil_bits_shader_key.dest_resource_format = dest_rt_key.resource_format;
+          stencil_bits_shader_key.mode = TransferMode::kDepthToStencilBit;
+          stencil_bits_shader_key.stencil_pack_stage = kTransferStencilPackStageBits;
+          ID3D12PipelineState* const* stencil_bits_pipelines =
+              GetOrCreateTransferPipelines(stencil_bits_shader_key);
+          TransferRootSignatureIndex stencil_bits_root_signature_index =
+              kTransferModes[size_t(TransferMode::kDepthToStencilBit)]
+                  .root_signature_no_stencil_ref;
+          uint32_t stencil_bits_root_parameters_used =
+              kTransferUsedRootParameters[size_t(stencil_bits_root_signature_index)];
+          if (last_transfer_root_signature_index != stencil_bits_root_signature_index) {
+            last_transfer_root_signature_index = stencil_bits_root_signature_index;
+            command_processor_.SetExternalGraphicsRootSignature(
+                transfer_root_signatures_[size_t(stencil_bits_root_signature_index)]);
+          }
+          // Rebind everything for the next transfer, with the stencil SRV
+          // replaced here.
+          transfer_root_parameters_set = 0;
+          last_descriptor_index_stencil = UINT32_MAX;
+          command_list.D3DSetGraphicsRootDescriptorTable(
+              rex::bit_count(stencil_bits_root_parameters_used &
+                             (kTransferUsedRootParameterStencilSRVBit - 1)),
+              current_temporary_descriptors_gpu_[stencil_pack_srv_index].second);
+          command_list.D3DSetGraphicsRoot32BitConstants(
+              rex::bit_count(stencil_bits_root_parameters_used &
+                             (kTransferUsedRootParameterAddressConstantBit - 1)),
+              sizeof(last_address_constant) / sizeof(uint32_t), &last_address_constant, 0);
+          command_processor_.SubmitBarriers();
+          for (uint32_t j = 0; stencil_bits_pipelines && j < 8; ++j) {
+            if (!(stencil_bits & (uint32_t(1) << j))) {
+              diag::stencil_bit_transfers_skipped.fetch_add(1, std::memory_order_relaxed);
+              continue;
+            }
+            diag::stencil_bit_transfers.fetch_add(1, std::memory_order_relaxed);
+            uint32_t transfer_stencil_bit = uint32_t(1) << j;
+            command_list.D3DSetGraphicsRoot32BitConstants(
+                rex::bit_count(stencil_bits_root_parameters_used &
+                               (kTransferUsedRootParameterStencilMaskConstantBit - 1)),
+                sizeof(transfer_stencil_bit) / sizeof(uint32_t), &transfer_stencil_bit, 0);
+            command_processor_.SetExternalPipeline(stencil_bits_pipelines[j]);
+            command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+          }
+          command_processor_.EndGpuProfileScope(draws_profile_scope,
+                                                diag::GpuCategory::kTransferStencilDraws);
+          continue;
+        }
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
             if (!(stencil_bits & (uint32_t(1) << j))) {

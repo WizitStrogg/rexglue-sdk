@@ -347,6 +347,17 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
     kCount,
   };
+  // Without SV_StencilRef, instead of computing the source stencil in each of
+  // the 8 stencil bit draws, it can be computed once and written to an R32_UINT
+  // texture (one byte per destination sample), and the bit draws read it.
+  enum TransferStencilPackStage : uint32_t {
+    kTransferStencilPackStageNone,
+    // Stencil bit mode shader writing the stencil of up to 4 samples to the
+    // stencil pack texture.
+    kTransferStencilPackStagePack,
+    // Stencil bit draws from the stencil pack texture (via the stencil SRV).
+    kTransferStencilPackStageBits,
+  };
   enum class TransferOutput {
     kColor,
     kDepth,
@@ -377,6 +388,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // swapping of 40-sample columns as opposed to the host render target -
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
+      // For stencil bit modes, writing the stencil in two stages through the
+      // stencil pack texture (TransferStencilPackStage).
+      uint32_t stencil_pack_stage : 2;
 
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional
@@ -712,6 +726,19 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+
+  // Makes sure the stencil pack texture is at least of the specified size.
+  bool EnsureStencilPackTexture(uint32_t width, uint32_t height);
+  ID3D12Resource* stencil_pack_texture_ = nullptr;
+  D3D12_RESOURCE_STATES stencil_pack_texture_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  uint32_t stencil_pack_texture_width_ = 0;
+  uint32_t stencil_pack_texture_height_ = 0;
+  // Replaced textures, may still be in use by the GPU.
+  std::vector<ID3D12Resource*> stencil_pack_retired_textures_;
+  // RTV (non-shader-visible).
+  ID3D12DescriptorHeap* stencil_pack_rtv_heap_ = nullptr;
+  // SRV (non-shader-visible, copied for use).
+  ID3D12DescriptorHeap* stencil_pack_srv_heap_ = nullptr;
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
