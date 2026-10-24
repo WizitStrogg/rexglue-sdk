@@ -36,6 +36,12 @@ enum class GpuCategory : uint32_t {
   kTextureLoads,
   kResolves,
   kMemoryUploads,
+  // Parts of render target transfers (within kRenderTargetTransfers).
+  kTransferHostDepthStore,
+  kTransferBarriers,
+  kTransferDraws,
+  kTransferStencilClears,
+  kTransferStencilDraws,
   kCount,
 };
 inline std::atomic<uint64_t> gpu_category_us[size_t(GpuCategory::kCount)];
@@ -93,8 +99,9 @@ inline std::string TakeSummary() {
       "memexport {} draws / {} KB, readback {} KB, CPU writes to GPU-written pages {}, merged "
       "uploads {} pages / {} dwords, {} submissions, GPU busy {} ms, command processor GPU "
       "waits {} ms (of the GPU time: render target transfers {} ms, texture loads {} ms, "
-      "resolves {} ms, memory uploads {} ms), submission thread {} ms (command processor waited "
-      "{} ms for it)",
+      "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
+      "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
+      "(command processor waited {} ms for it)",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0), submissions.exchange(0),
@@ -103,6 +110,11 @@ inline std::string TakeSummary() {
       gpu_category_us[size_t(GpuCategory::kTextureLoads)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kResolves)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kMemoryUploads)].exchange(0) / 1000,
+      gpu_category_us[size_t(GpuCategory::kTransferHostDepthStore)].exchange(0) / 1000,
+      gpu_category_us[size_t(GpuCategory::kTransferBarriers)].exchange(0) / 1000,
+      gpu_category_us[size_t(GpuCategory::kTransferDraws)].exchange(0) / 1000,
+      gpu_category_us[size_t(GpuCategory::kTransferStencilClears)].exchange(0) / 1000,
+      gpu_category_us[size_t(GpuCategory::kTransferStencilDraws)].exchange(0) / 1000,
       submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000) +
          "; " + TakeTransferSummary();
 }
