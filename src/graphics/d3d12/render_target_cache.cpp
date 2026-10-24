@@ -3830,6 +3830,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   // Do host depth storing for the depth destination (assuming there can be only
   // one depth destination) where depth destination == host depth source.
+  D3D12CommandProcessor::GpuProfileScope host_depth_store_profile_scope =
+      command_processor_.BeginGpuProfileScope();
   bool host_depth_store_set_up = false;
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
@@ -3923,6 +3925,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     }
     break;
   }
+
+  command_processor_.EndGpuProfileScope(host_depth_store_profile_scope,
+                                        diag::GpuCategory::kTransferHostDepthStore);
 
   // Try to insert as many barriers as possible in one place, hoping that in the
   // best case (no cross-copying between current render targets), barriers will
@@ -4229,6 +4234,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       // bits that need to be 1 by discarding samples. Clearing everything here
       // to reduce context switches internally in the driver if clear causes
       // them.
+      D3D12CommandProcessor::GpuProfileScope stencil_clear_profile_scope =
+          command_processor_.BeginGpuProfileScope();
       if (stencil_clear_rectangle_count) {
         command_processor_.SubmitBarriers();
         D3D12_RECT* stencil_clear_rect_write_ptr = command_list.ClearDepthStencilViewAllocatedRects(
@@ -4257,6 +4264,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
         }
       }
+
+      command_processor_.EndGpuProfileScope(stencil_clear_profile_scope,
+                                            diag::GpuCategory::kTransferStencilClears);
 
       // Perform the transfers for the render target.
 
@@ -4566,7 +4576,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                                 : 0xFF;
           }
         }
+        D3D12CommandProcessor::GpuProfileScope barriers_profile_scope =
+            command_processor_.BeginGpuProfileScope();
         command_processor_.SubmitBarriers();
+        command_processor_.EndGpuProfileScope(barriers_profile_scope,
+                                              diag::GpuCategory::kTransferBarriers);
+        D3D12CommandProcessor::GpuProfileScope draws_profile_scope =
+            command_processor_.BeginGpuProfileScope();
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
             if (!(stencil_bits & (uint32_t(1) << j))) {
@@ -4583,6 +4599,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
         }
+        command_processor_.EndGpuProfileScope(draws_profile_scope,
+                                              is_stencil_bit
+                                                  ? diag::GpuCategory::kTransferStencilDraws
+                                                  : diag::GpuCategory::kTransferDraws);
       }
     }
 
