@@ -162,6 +162,11 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
       ImGui::SetCursorPosX(110.0f);
       ImGui::TextColored(kMuted, "%s", campaign_status.c_str());
     }
+    const std::string backup = rex::cvar::GetFlagByName("coop_backup_last");
+    if (!backup.empty()) {
+      ImGui::SetCursorPosX(110.0f);
+      ImGui::TextColored(kMuted, "%s", backup.c_str());
+    }
   }
 
   // --- Players -------------------------------------------------------------
