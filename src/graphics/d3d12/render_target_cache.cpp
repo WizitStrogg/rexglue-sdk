@@ -61,10 +61,11 @@ REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_pixel_rate, true, "GPU/D3D12",
                     "of once per sample.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_pack, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil_pack, false, "GPU/D3D12",
                     "Without native stencil value output, in render target transfers to 1x and 4x "
                     "MSAA depth, compute the stencil once into a scratch texture and do the "
-                    "bit-by-bit stencil draws from it instead of computing it in every bit draw.")
+                    "bit-by-bit stencil draws from it instead of computing it in every bit draw "
+                    "(slower on Nvidia, where the bit draws are bound by stencil writes).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil, true, "GPU/D3D12",
