@@ -2427,10 +2427,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  GpuProfileScope transfers_profile_scope = BeginGpuProfileScope();
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  EndGpuProfileScope(transfers_profile_scope, diag::GpuCategory::kRenderTargetTransfers);
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -2478,7 +2480,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  GpuProfileScope textures_profile_scope = BeginGpuProfileScope();
   texture_cache_->RequestTextures(used_texture_mask);
+  EndGpuProfileScope(textures_profile_scope, diag::GpuCategory::kTextureLoads);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -3086,8 +3090,11 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    GpuProfileScope resolve_profile_scope = BeginGpuProfileScope();
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    EndGpuProfileScope(resolve_profile_scope, diag::GpuCategory::kResolves);
+    return resolved;
   }
   return IssueCopy_ReadbackResolvePath();
 }
@@ -3584,9 +3591,12 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     if (timestamp_query_heap_) {
       uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+      timestamp_slot.submission = submission_current_;
+      timestamp_slot.used = 2;
+      timestamp_slot.scopes.clear();
       deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                         slot * 2);
-      timestamp_slot_submission_[slot] = submission_current_;
+                                         slot * kTimestampsPerSubmission);
     }
 
     // Reset cached state of the command list.
@@ -3702,12 +3712,13 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     if (timestamp_query_heap_) {
       uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      const TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+      uint32_t slot_first = slot * kTimestampsPerSubmission;
       deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                         slot * 2 + 1);
-      deferred_command_list_.D3DResolveQueryData(timestamp_query_heap_.Get(),
-                                                 D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2,
-                                                 timestamp_readback_.Get(),
-                                                 sizeof(uint64_t) * slot * 2);
+                                         slot_first + 1);
+      deferred_command_list_.D3DResolveQueryData(
+          timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_first,
+          timestamp_slot.used, timestamp_readback_.Get(), sizeof(uint64_t) * slot_first);
     }
     diag::submissions.fetch_add(1, std::memory_order_relaxed);
 
@@ -5205,15 +5216,17 @@ void D3D12CommandProcessor::InitializeTimestampResources() {
   }
   D3D12_QUERY_HEAP_DESC heap_desc = {};
   heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-  heap_desc.Count = kTimestampSubmissionSlots * 2;
+  heap_desc.Count = kTimestampSubmissionSlots * kTimestampsPerSubmission;
   if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&timestamp_query_heap_)))) {
     return;
   }
   D3D12_RESOURCE_DESC buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(
-      buffer_desc, sizeof(uint64_t) * kTimestampSubmissionSlots * 2, D3D12_RESOURCE_FLAG_NONE);
+      buffer_desc, sizeof(uint64_t) * kTimestampSubmissionSlots * kTimestampsPerSubmission,
+      D3D12_RESOURCE_FLAG_NONE);
   void* mapping = nullptr;
-  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kTimestampSubmissionSlots * 2};
+  D3D12_RANGE read_range = {0,
+                            sizeof(uint64_t) * kTimestampSubmissionSlots * kTimestampsPerSubmission};
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesReadback, GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
           &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -5224,7 +5237,9 @@ void D3D12CommandProcessor::InitializeTimestampResources() {
     return;
   }
   timestamp_readback_mapping_ = static_cast<const uint64_t*>(mapping);
-  std::memset(timestamp_slot_submission_, 0, sizeof(timestamp_slot_submission_));
+  for (TimestampSlot& timestamp_slot : timestamp_slots_) {
+    timestamp_slot = {};
+  }
 }
 
 void D3D12CommandProcessor::ShutdownTimestampResources() {
@@ -5244,19 +5259,73 @@ void D3D12CommandProcessor::CollectTimestamps(uint64_t completed_before, uint64_
                                                       ? completed_now - kTimestampSubmissionSlots + 1
                                                       : uint64_t(1));
   uint64_t busy_ticks = 0;
+  uint64_t category_ticks[size_t(diag::GpuCategory::kCount)] = {};
   for (uint64_t submission = first; submission <= completed_now; ++submission) {
     uint32_t slot = uint32_t(submission % kTimestampSubmissionSlots);
-    if (timestamp_slot_submission_[slot] != submission) {
+    const TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+    if (timestamp_slot.submission != submission) {
       continue;
     }
-    uint64_t begin = timestamp_readback_mapping_[slot * 2];
-    uint64_t end = timestamp_readback_mapping_[slot * 2 + 1];
-    if (end > begin) {
-      busy_ticks += end - begin;
+    const uint64_t* queries = timestamp_readback_mapping_ + slot * kTimestampsPerSubmission;
+    if (queries[1] > queries[0]) {
+      busy_ticks += queries[1] - queries[0];
+    }
+    for (const auto& scope : timestamp_slot.scopes) {
+      uint64_t begin = queries[scope.second];
+      uint64_t end = queries[scope.second + 1];
+      if (end > begin) {
+        category_ticks[scope.first] += end - begin;
+      }
     }
   }
   diag::gpu_busy_us.fetch_add(busy_ticks * 1000000 / timestamp_frequency_,
                               std::memory_order_relaxed);
+  for (size_t i = 0; i < size_t(diag::GpuCategory::kCount); ++i) {
+    diag::gpu_category_us[i].fetch_add(category_ticks[i] * 1000000 / timestamp_frequency_,
+                                       std::memory_order_relaxed);
+  }
+}
+
+D3D12CommandProcessor::GpuProfileScope D3D12CommandProcessor::BeginGpuProfileScope() {
+  GpuProfileScope scope;
+  if (!timestamp_query_heap_ || !submission_open_) {
+    return scope;
+  }
+  uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+  TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+  if (timestamp_slot.submission != submission_current_ ||
+      timestamp_slot.used + 2 > kTimestampsPerSubmission) {
+    return scope;
+  }
+  scope.query_index = timestamp_slot.used;
+  scope.submission = submission_current_;
+  scope.stream_size_before = deferred_command_list_.GetStreamSize();
+  deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     slot * kTimestampsPerSubmission + scope.query_index);
+  scope.stream_size_after_query = deferred_command_list_.GetStreamSize();
+  timestamp_slot.used += 2;
+  return scope;
+}
+
+void D3D12CommandProcessor::EndGpuProfileScope(const GpuProfileScope& scope,
+                                               diag::GpuCategory category) {
+  if (scope.query_index == UINT32_MAX || scope.submission != submission_current_ ||
+      !submission_open_) {
+    return;
+  }
+  uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+  TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+  if (deferred_command_list_.GetStreamSize() == scope.stream_size_after_query) {
+    // Nothing recorded - drop the query, keeping the list of queries dense.
+    if (timestamp_slot.used == scope.query_index + 2) {
+      deferred_command_list_.TruncateStream(scope.stream_size_before);
+      timestamp_slot.used -= 2;
+      return;
+    }
+  }
+  deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     slot * kTimestampsPerSubmission + scope.query_index + 1);
+  timestamp_slot.scopes.emplace_back(uint32_t(category), scope.query_index);
 }
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
