@@ -4,6 +4,7 @@
  * the logging interval of the command processor's guest-visible write log.
  */
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <algorithm>
@@ -72,6 +73,16 @@ inline std::atomic<uint64_t> stencil_bit_transfers{0};
 inline std::atomic<uint64_t> stencil_bit_transfers_skipped{0};
 // Depth transfers whose stencil the destination already holds.
 inline std::atomic<uint64_t> stencil_unchanged_transfers{0};
+// EDRAM tiles of transfers to depth by why the stencil had to be copied:
+// 0 - kept (not copied), 1 - color write, 2 - draw writing stencil, 3 - clear,
+// 4 - held only by other depth render targets, 5 - came from color with no
+// depth holding it, 6 - no tracking, 7 - never tracked.
+inline std::array<std::atomic<uint64_t>, 8> stencil_transfer_tiles_by_reason{};
+inline void RecordStencilTransfer(uint32_t reason, uint32_t tiles) {
+  stencil_transfer_tiles_by_reason[reason & 7].fetch_add(tiles, std::memory_order_relaxed);
+}
+// Draws to depth that may change the stencil.
+inline std::atomic<uint64_t> stencil_write_draws{0};
 // EDRAM tiles of transfers back to a render target still holding the data.
 inline std::atomic<uint64_t> redundant_transfer_tiles{0};
 inline std::string TakeTransferSummary() {
@@ -80,7 +91,13 @@ inline std::string TakeTransferSummary() {
   transfer_stats.clear();
   std::sort(entries.begin(), entries.end(),
             [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
-  std::string result =
+  std::string result = "stencil to depth tiles by reason (kept/color write/stencil draw/clear/"
+                       "other depth/from color/untracked/never):";
+  for (auto& reason_tiles : stencil_transfer_tiles_by_reason) {
+    result += fmt::format(" {}", reason_tiles.exchange(0));
+  }
+  result += fmt::format("; stencil-writing draws {}; ", stencil_write_draws.exchange(0));
+  result +=
       fmt::format("stencil bit draws {} done, {} skipped; stencil kept in {} transfers; "
                   "redundant transfers {} tiles; render target transfers by EDRAM tiles:",
                   stencil_bit_transfers.exchange(0), stencil_bit_transfers_skipped.exchange(0),

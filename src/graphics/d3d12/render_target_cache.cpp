@@ -55,6 +55,13 @@ REXCVAR_DEFINE_BOOL(d3d12_skip_zero_stencil_transfers, true, "GPU/D3D12",
                     "clears, or anything after color writes)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_transfer_stencil, true, "GPU/D3D12",
+                    "Experimental: false skips copying the stencil in depth render target "
+                    "transfers without native stencil value output, leaving the destination's "
+                    "old stencil (may break stencil-based effects). For measuring the cost of the "
+                    "bit-by-bit stencil copies.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -4142,7 +4149,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
-      bool need_stencil_bit_draws = dest_rt_key.is_depth && !use_stencil_reference_output_;
+      bool need_stencil_bit_draws = dest_rt_key.is_depth && !use_stencil_reference_output_ &&
+                                    REXCVAR_GET(d3d12_transfer_stencil);
       current_transfer_invocations_.clear();
       current_transfer_invocations_.reserve(current_transfers.size()
                                             << uint32_t(need_stencil_bit_draws));
