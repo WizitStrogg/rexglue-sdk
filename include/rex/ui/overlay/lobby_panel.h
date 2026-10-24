@@ -46,5 +46,9 @@ class LobbyPanelDialog : public ImGuiDialog {
 
 // Sets the panel's view (UTF-8, format above); "" hides it. Any thread.
 extern "C" void rex_ui_set_lobby_view(const char* view);
+// A full-screen cover card drawn above everything, independent of the view
+// (the view's own changes never clear it): "" hides it; lines after the first
+// (newline-separated) are shown under it, dimmed. Any thread.
+extern "C" void rex_ui_set_lobby_cover(const char* text);
 // The .bft font the panel draws with ("" = ImGui's own font). Any thread.
 extern "C" void rex_ui_set_lobby_font(const char* bft_path);

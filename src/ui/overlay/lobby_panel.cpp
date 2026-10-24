@@ -38,6 +38,7 @@ namespace {
 
 std::mutex g_view_mutex;
 std::string g_view;
+std::string g_cover;
 std::string g_font_path;
 
 // --- the game's bitmap font -------------------------------------------------------
@@ -251,7 +252,18 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
   std::string view;
   {
     std::lock_guard<std::mutex> lock(g_view_mutex);
-    view = g_view;
+    // The cover wins over the view (and is set separately, so a menu closing
+    // underneath it cannot clear it).
+    if (!g_cover.empty()) {
+      std::string c = "C";
+      for (char ch : g_cover) {
+        c.push_back(ch);
+        if (ch == '\n') c.push_back('D');
+      }
+      view = c;
+    } else {
+      view = g_view;
+    }
   }
   static size_t s_logged_size = ~size_t(0);
   if (view.size() != s_logged_size) {
@@ -326,8 +338,14 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
   const float x0 = 232 * sx, x1 = 618 * sx;
   float y = 104 * sy;
   float content_h = 0;
-  for (const auto& l : lines) content_h += l.kind == 'R' ? 58 * sy : (l.kind == 'F' ? 0 : 34 * sy);
-  const ImVec2 board_a(214 * sx, 34 * sy), board_b(650 * sx, std::max(y + content_h + 16 * sy, 420 * sy));
+  bool has_footer = false;
+  for (const auto& l : lines) {
+    content_h += l.kind == 'R' ? 58 * sy : (l.kind == 'F' ? 0 : 34 * sy);
+    has_footer |= l.kind == 'F';
+  }
+  // From x 184: the board also hides the stock menu's own A medallion (x 192..246).
+  const ImVec2 board_a(184 * sx, 34 * sy),
+      board_b(650 * sx, std::max(y + content_h + (has_footer ? 44 : 16) * sy, 420 * sy));
   dl->AddRectFilled(ImVec2(board_a.x + 3 * s, board_a.y + 4 * s), ImVec2(board_b.x + 3 * s, board_b.y + 4 * s),
                     IM_COL32(0, 0, 0, 120), 18 * s, ImDrawFlags_RoundCornersRight);
   dl->AddRectFilled(board_a, board_b, kLeather, 18 * s, ImDrawFlags_RoundCornersRight);
@@ -366,7 +384,7 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
     }
   }
   if (!footer.empty()) {
-    DrawText(dl, tex, ImVec2(x0 + 18 * sx, board_b.y - 34 * sy), 0.55f * s, kDim, footer);
+    DrawText(dl, tex, ImVec2(x0 + 18 * sx, board_b.y - 30 * sy), 0.55f * s, kDim, footer);
   }
 }
 
@@ -375,6 +393,11 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
 extern "C" void rex_ui_set_lobby_view(const char* view) {
   std::lock_guard<std::mutex> lock(rex::ui::g_view_mutex);
   rex::ui::g_view = view ? view : "";
+}
+
+extern "C" void rex_ui_set_lobby_cover(const char* text) {
+  std::lock_guard<std::mutex> lock(rex::ui::g_view_mutex);
+  rex::ui::g_cover = text ? text : "";
 }
 
 extern "C" void rex_ui_set_lobby_font(const char* bft_path) {
