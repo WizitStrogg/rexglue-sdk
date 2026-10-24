@@ -47,6 +47,13 @@ REXCVAR_DEFINE_BOOL(async_guest_writes_counter_immediate, false, "GPU",
                     "after the GPU work before it has completed")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(async_guest_writes_wait_lookup, false, "GPU",
+                    "Experimental: let WAIT_REG_MEM see asynchronous guest-visible writes that "
+                    "are still queued instead of draining the queue. Suspected of freezing Fable "
+                    "II while loading: the queued write is then done later, possibly after a "
+                    "newer CPU write to the same memory (the frame counter)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
                      "When the command processor has had no commands for this many "
                      "milliseconds, write the current GPU counter to where the last counter "
@@ -1366,9 +1373,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
-      // Writes queued asynchronously earlier in the command stream have
-      // already happened from the GPU's point of view.
-      value = LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3), &value_from_queue);
+      // With async_guest_writes_wait_lookup, writes queued asynchronously
+      // earlier in the command stream are treated as already done, as they
+      // are from the GPU's point of view.
+      if (REXCVAR_GET(async_guest_writes_wait_lookup)) {
+        value = LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3), &value_from_queue);
+      } else {
+        value = *reinterpret_cast<uint32_t*>(
+            memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      }
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
