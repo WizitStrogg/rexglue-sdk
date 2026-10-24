@@ -14,10 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -465,6 +468,32 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_writable_last_ = nullptr;
   CommandAllocator* command_allocator_submitted_first_ = nullptr;
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
+  // Submission thread (d3d12_submission_thread): replays deferred command
+  // lists into the D3D12 command list and submits them, so the driver's work
+  // happens in parallel with the command processor.
+  struct SubmissionJob {
+    std::vector<uintmax_t> stream;
+    ID3D12CommandAllocator* command_allocator;
+    uint64_t fence_value;
+  };
+  std::thread submission_thread_;
+  std::mutex submission_mutex_;
+  std::condition_variable submission_work_cond_;
+  std::condition_variable submission_idle_cond_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  bool submission_thread_busy_ = false;
+  bool submission_thread_exit_ = false;
+  std::unique_ptr<DeferredCommandList> submission_thread_list_;
+  void SubmissionThreadMain();
+  void ExecuteSubmissionJob(SubmissionJob& job, DeferredCommandList& list);
+
+ public:
+  // Waits until the submission thread has submitted everything given to it,
+  // before something else is submitted to the queue that must come after it.
+  void FlushSubmissionThread();
+
+ private:
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
