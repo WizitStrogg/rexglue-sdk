@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -603,12 +604,47 @@ class RenderTargetCache {
     // it. Without stencil output from pixel shaders, transfers to depth copy
     // stencil bit by bit, and only need these bits.
     uint32_t stencil_bits = 0xFF;
-    // A depth render target other than the owner that still holds the same
+    // Depth render targets other than the owner that still hold the same
     // stencil for this range: like clean_source, but only reset by writes that
     // may change the stencil (in the depth / stencil interpretation), so depth
     // switching between MSAA sample counts with only depth written in between
-    // doesn't need to copy the stencil back bit by bit.
-    RenderTargetKey stencil_clean_source;
+    // doesn't need to copy the stencil back bit by bit. Most recent first.
+    std::array<RenderTargetKey, 3> stencil_clean_sources;
+    // Why stencil_clean_sources was last emptied (diag::StencilResetReason).
+    uint8_t stencil_reset_reason = 7;
+    bool IsStencilCleanIn(RenderTargetKey key) const {
+      for (RenderTargetKey clean_key : stencil_clean_sources) {
+        if (!clean_key.IsEmpty() && clean_key == key) {
+          return true;
+        }
+      }
+      return false;
+    }
+    void ResetStencilCleanSources(uint8_t reason) {
+      stencil_clean_sources.fill(RenderTargetKey());
+      stencil_reset_reason = reason;
+    }
+    // The data moves from `previous_owner` to `new_owner` without changing.
+    void MoveStencilCleanSources(RenderTargetKey previous_owner, RenderTargetKey new_owner) {
+      std::array<RenderTargetKey, 3> old_sources = stencil_clean_sources;
+      stencil_clean_sources.fill(RenderTargetKey());
+      size_t count = 0;
+      if (previous_owner.is_depth) {
+        stencil_clean_sources[count++] = previous_owner;
+      }
+      for (RenderTargetKey old_key : old_sources) {
+        if (count >= stencil_clean_sources.size()) {
+          break;
+        }
+        if (old_key.IsEmpty() || old_key == new_owner || old_key == previous_owner) {
+          continue;
+        }
+        stencil_clean_sources[count++] = old_key;
+      }
+      if (!count) {
+        stencil_reset_reason = 5;
+      }
+    }
     OwnershipRange(uint32_t end_tiles, RenderTargetKey render_target,
                    RenderTargetKey host_depth_render_target_unorm24,
                    RenderTargetKey host_depth_render_target_float24)
@@ -648,7 +684,7 @@ class RenderTargetCache {
              host_depth_render_target_unorm24 == other_range.host_depth_render_target_unorm24 &&
              host_depth_render_target_float24 == other_range.host_depth_render_target_float24 &&
              clean_source == other_range.clean_source && stencil_bits == other_range.stencil_bits &&
-             stencil_clean_source == other_range.stencil_clean_source;
+             stencil_clean_sources == other_range.stencil_clean_sources;
     }
   };
 
@@ -670,9 +706,10 @@ class RenderTargetCache {
   // barrier and addressed by different target-independent rasterization pixel
   // positions.
   // Marks the range as written by its owner, so the previous owner no longer
-  // holds the same data (and, if `stencil_written`, the same stencil).
+  // holds the same data (and, if `stencil_reset_reason` is not 0, the same
+  // stencil).
   void MarkOwnershipRangeWritten(RenderTargetKey key, uint32_t start_tiles_base_relative,
-                                 uint32_t length_tiles, bool stencil_written);
+                                 uint32_t length_tiles, uint8_t stencil_reset_reason);
   // Adds stencil bits that may be non-zero to the ranges, or with `assign`,
   // sets them for the ranges fully within the extent (completely overwritten).
   void UpdateOwnershipRangeStencilBits(RenderTargetKey key, uint32_t start_tiles_base_relative,
