@@ -28,6 +28,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/ui/overlay/coop_overlay.h>
+#include <rex/ui/overlay/lobby_panel.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -473,6 +474,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     RefreshOverlayOpen();
   });
 
+  lobby_panel_ = std::make_unique<ui::LobbyPanelDialog>(imgui_drawer_.get());
   OnCreateDialogs(imgui_drawer_.get());
 }
 
@@ -623,6 +625,7 @@ void ReXApp::OnDestroy() {
   achievements_overlay_.reset();
   settings_overlay_.reset();
   coop_overlay_.reset();
+  lobby_panel_.reset();
   console_overlay_.reset();
   any_overlay_open_.store(false, std::memory_order_relaxed);
   debug_overlay_.reset();

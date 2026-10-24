@@ -52,6 +52,7 @@ class AchievementNotificationDialog;
 class ConsoleDialog;
 class SettingsDialog;
 class CoopDialog;
+class LobbyPanelDialog;
 }  // namespace ui
 
 /// Base class for recompiled Xbox 360 applications.
@@ -316,6 +317,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
   std::unique_ptr<ui::CoopDialog> coop_overlay_;
+  std::unique_ptr<ui::LobbyPanelDialog> lobby_panel_;  // game-driven (rex_ui_set_lobby_view)
   std::atomic<bool> any_overlay_open_{false};
   void RefreshOverlayOpen();
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;

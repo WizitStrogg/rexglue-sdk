@@ -152,6 +152,23 @@ void CoopDialog::OnDraw(ImGuiIO& /*io*/) {
     }
   }
 
+  // --- Co-op campaign (Fable-2-Recomp feature 001) ----------------------------
+  if (!rex::cvar::GetFlagByName("coop_campaign").empty()) {
+    ImGui::SeparatorText("Co-op campaign");
+    option_checkbox("coop_campaign",
+                    "New Game offers Solo / Co-op; Continue on a campaign save opens its lobby");
+    const std::string campaign_status = rex::cvar::GetFlagByName("coop_campaign_status");
+    if (!campaign_status.empty()) {
+      ImGui::SetCursorPosX(110.0f);
+      ImGui::TextColored(kMuted, "%s", campaign_status.c_str());
+    }
+    const std::string backup = rex::cvar::GetFlagByName("coop_backup_last");
+    if (!backup.empty()) {
+      ImGui::SetCursorPosX(110.0f);
+      ImGui::TextColored(kMuted, "%s", backup.c_str());
+    }
+  }
+
   // --- Players -------------------------------------------------------------
   ImGui::SeparatorText("Players on your network");
   if (!status.networking_enabled) {

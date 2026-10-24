@@ -63,6 +63,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void Draw(UIDrawContext& ui_draw_context) override;
 
+  // For dialogs that draw their own textures (ImTextureID = ImmediateTexture*).
+  // May be null before a presenter is attached; can change when it is.
+  ImmediateDrawer* immediate_drawer() const { return immediate_drawer_; }
+
  protected:
   void OnKeyDown(KeyEvent& e) override;
   void OnKeyUp(KeyEvent& e) override;
