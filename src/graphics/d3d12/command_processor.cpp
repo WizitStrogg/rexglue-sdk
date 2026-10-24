@@ -2436,7 +2436,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (normalized_depth_control.stencil_enable) {
     auto* depth_render_target = render_target_cache_->GetLastUpdateDepthRenderTarget();
     if (depth_render_target) {
-      depth_render_target->SetStencilMaybeNonzero();
+      uint32_t stencil_write_mask = reg::RB_STENCILREFMASK{
+          register_file_->values[XE_GPU_REG_RB_STENCILREFMASK]}.stencilwritemask;
+      if (normalized_depth_control.backface_enable) {
+        stencil_write_mask |= reg::RB_STENCILREFMASK{
+            register_file_->values[XE_GPU_REG_RB_STENCILREFMASK_BF]}.stencilwritemask;
+      }
+      depth_render_target->AddStencilMaybeNonzeroBits(stencil_write_mask);
     }
   }
 
