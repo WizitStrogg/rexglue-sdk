@@ -4397,8 +4397,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
       bool need_stencil_bit_draws = dest_rt_key.is_depth && !use_stencil_reference_output_ &&
-                                    REXCVAR_GET(d3d12_transfer_stencil) &&
-                                    AreStencilTransfersNeeded();
+                                    REXCVAR_GET(d3d12_transfer_stencil);
+      // If no draw uses the stencil values, only clear the stencil (so data
+      // reinterpreted as color later has the most likely stencil, zero, rather
+      // than whatever was in the destination before), without the bit draws.
+      bool stencil_bits_needed = AreStencilTransfersNeeded();
       current_transfer_invocations_.clear();
       current_transfer_invocations_.reserve(current_transfers.size()
                                             << uint32_t(need_stencil_bit_draws));
@@ -4466,7 +4469,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 nullptr, resolve_clear_rectangle);
             diag::RecordStencilTransferBits(transfer.stencil_bits,
                                             transfer.end_tiles - transfer.start_tiles);
-            if (!transfer.stencil_bits && REXCVAR_GET(d3d12_skip_zero_stencil_transfers)) {
+            if (!stencil_bits_needed ||
+                (!transfer.stencil_bits && REXCVAR_GET(d3d12_skip_zero_stencil_transfers))) {
               // The stencil is all zeros in the range - clearing the
               // destination's stencil is enough, no need for the bit draws.
               diag::stencil_bit_transfers_skipped.fetch_add(8, std::memory_order_relaxed);
