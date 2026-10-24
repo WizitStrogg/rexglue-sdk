@@ -70,6 +70,8 @@ inline std::string (*describe_render_target_key)(uint32_t key_without_base_pitch
 // reference output), done and skipped because the bit is zero in the source.
 inline std::atomic<uint64_t> stencil_bit_transfers{0};
 inline std::atomic<uint64_t> stencil_bit_transfers_skipped{0};
+// Depth transfers whose stencil the destination already holds.
+inline std::atomic<uint64_t> stencil_unchanged_transfers{0};
 // EDRAM tiles of transfers back to a render target still holding the data.
 inline std::atomic<uint64_t> redundant_transfer_tiles{0};
 inline std::string TakeTransferSummary() {
@@ -79,10 +81,10 @@ inline std::string TakeTransferSummary() {
   std::sort(entries.begin(), entries.end(),
             [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
   std::string result =
-      fmt::format("stencil bit draws {} done, {} skipped; redundant transfers {} "
-                  "tiles; render target transfers by EDRAM tiles:",
+      fmt::format("stencil bit draws {} done, {} skipped; stencil kept in {} transfers; "
+                  "redundant transfers {} tiles; render target transfers by EDRAM tiles:",
                   stencil_bit_transfers.exchange(0), stencil_bit_transfers_skipped.exchange(0),
-                  redundant_transfer_tiles.exchange(0));
+                  stencil_unchanged_transfers.exchange(0), redundant_transfer_tiles.exchange(0));
   for (size_t i = 0; i < std::min(entries.size(), size_t(8)); ++i) {
     uint32_t source = uint32_t(entries[i].first >> 32);
     uint32_t dest = uint32_t(entries[i].first);
