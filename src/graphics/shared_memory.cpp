@@ -23,9 +23,10 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, false, "GPU",
-                    "Experimental: when the CPU writes to memory holding GPU-written data that "
-                    "was not read back, upload only the dwords the CPU changed, keeping the "
+REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, true, "GPU",
+                    "When the CPU writes to memory holding GPU-written data that may not have "
+                    "been read back yet (always possible with readback_memexport_lazy or with "
+                    "memexport readback off), upload only the dwords the CPU changed, keeping the "
                     "GPU's results in the rest")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 

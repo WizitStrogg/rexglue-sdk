@@ -69,6 +69,26 @@ inline std::atomic<uint64_t> frame_limiter_late_frames{0};
 inline std::atomic<uint64_t> frame_limiter_resets{0};
 // Command processor time with no guest commands to execute, in microseconds.
 inline std::atomic<uint64_t> cp_idle_us{0};
+// Guest frames (swap to swap) longer than 20, 33 and 50 ms, and the longest.
+inline std::atomic<uint64_t> frames_over_20ms{0};
+inline std::atomic<uint64_t> frames_over_33ms{0};
+inline std::atomic<uint64_t> frames_over_50ms{0};
+inline std::atomic<uint64_t> longest_frame_us{0};
+inline void RecordFrameTime(uint64_t frame_us) {
+  if (frame_us > 20000) {
+    frames_over_20ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (frame_us > 33333) {
+    frames_over_33ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (frame_us > 50000) {
+    frames_over_50ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint64_t longest = longest_frame_us.load(std::memory_order_relaxed);
+  while (frame_us > longest &&
+         !longest_frame_us.compare_exchange_weak(longest, frame_us, std::memory_order_relaxed)) {
+  }
+}
 
 // Render target ownership transfers (EDRAM data copied between host render
 // targets): count and EDRAM tiles, by source and destination render target
@@ -170,7 +190,8 @@ inline std::string TakeSummary() {
       "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
       "(command processor waited {} ms for it), lazy readbacks {}, guest accesses to pages "
       "being read back {} ({} waited, {} ms), command processor reads of them {}, frame "
-      "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms",
+      "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms, "
+      "frames over 20/33/50 ms {}/{}/{}, longest {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0), submissions.exchange(0),
@@ -189,7 +210,8 @@ inline std::string TakeSummary() {
       lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0),
       frame_limiter_wait_us.exchange(0) / 1000, frame_limiter_waits.exchange(0),
       frame_limiter_late_frames.exchange(0), frame_limiter_resets.exchange(0),
-      cp_idle_us.exchange(0) / 1000) +
+      cp_idle_us.exchange(0) / 1000, frames_over_20ms.exchange(0), frames_over_33ms.exchange(0),
+      frames_over_50ms.exchange(0), longest_frame_us.exchange(0) / 1000) +
          "; " + TakeTransferSummary();
 }
 

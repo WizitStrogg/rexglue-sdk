@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -581,6 +582,9 @@ class RenderTargetCache {
 
   int32_t frame_log_last_request_ = 0;
   uint32_t frame_log_draws_since_line_ = 0;
+  uint32_t frame_log_auto_count_ = 0;
+  std::chrono::steady_clock::time_point frame_log_last_swap_{};
+  std::chrono::steady_clock::time_point frame_log_last_auto_{};
   std::array<RenderTargetKey, 1 + xenos::kMaxColorRenderTargets> frame_log_last_keys_{};
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;

@@ -63,6 +63,12 @@ REXCVAR_DEFINE_INT32(render_target_frame_log, 0, "GPU",
                      "as RTLOG lines")
     .range(0, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(render_target_frame_log_slow_ms, 0, "GPU",
+                     "Diagnostic: when above 0, also log one frame with render_target_frame_log "
+                     "after a frame that took longer than this many milliseconds, at most once "
+                     "every 10 seconds and 30 times per run")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
@@ -431,9 +437,15 @@ void RenderTargetCache::BeginFrame() {
 }
 
 void RenderTargetCache::OnSwapForFrameLog() {
+  auto now = std::chrono::steady_clock::now();
+  double frame_ms = frame_log_last_swap_.time_since_epoch().count()
+                        ? std::chrono::duration<double, std::milli>(now - frame_log_last_swap_)
+                              .count()
+                        : 0.0;
+  frame_log_last_swap_ = now;
   if (frame_log_frames_remaining_) {
-    REXGPU_INFO("RTLOG frame end: {} draws, {} since the last line", frame_log_draw_,
-                frame_log_draws_since_line_);
+    REXGPU_INFO("RTLOG frame end: {} draws, {} since the last line, {:.1f} ms", frame_log_draw_,
+                frame_log_draws_since_line_, frame_ms);
     --frame_log_frames_remaining_;
   }
   int32_t request = REXCVAR_GET(render_target_frame_log);
@@ -442,6 +454,15 @@ void RenderTargetCache::OnSwapForFrameLog() {
     if (request > 0 && !frame_log_frames_remaining_) {
       frame_log_frames_remaining_ = uint32_t(std::min(request, int32_t(8)));
     }
+  }
+  int32_t slow_ms = REXCVAR_GET(render_target_frame_log_slow_ms);
+  if (slow_ms > 0 && !frame_log_frames_remaining_ && frame_ms > double(slow_ms) &&
+      frame_log_auto_count_ < 30 &&
+      (!frame_log_auto_count_ || now - frame_log_last_auto_ >= std::chrono::seconds(10))) {
+    ++frame_log_auto_count_;
+    frame_log_last_auto_ = now;
+    frame_log_frames_remaining_ = 1;
+    REXGPU_INFO("RTLOG auto capture {} after a {:.1f} ms frame", frame_log_auto_count_, frame_ms);
   }
   if (frame_log_frames_remaining_) {
     frame_log_draw_ = 0;

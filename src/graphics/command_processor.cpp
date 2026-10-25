@@ -1407,6 +1407,17 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   // The small guest FPS readout also works in Release, where the full
   // profiling macros compile out. Shared runtime counters feed the F3 UI.
+  {
+    // Command processor thread only.
+    static GuestFrameMeter::Clock::time_point last_swap_time{};
+    auto swap_time = GuestFrameMeter::Clock::now();
+    if (last_swap_time.time_since_epoch().count()) {
+      diag::RecordFrameTime(uint64_t(
+          std::chrono::duration_cast<std::chrono::microseconds>(swap_time - last_swap_time)
+              .count()));
+    }
+    last_swap_time = swap_time;
+  }
   auto mean_us = guest_frame_meter_.Record(GuestFrameMeter::Clock::now());
   rex::perf::SetCounter(rex::perf::CounterId::kFrameTimeUs, mean_us);
   rex::perf::SetCounter(rex::perf::CounterId::kFps, mean_us > 0 ? 1000000 / mean_us : 0);
