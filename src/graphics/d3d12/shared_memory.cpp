@@ -318,6 +318,7 @@ bool D3D12SharedMemory::UploadRanges(
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
+  diag::upload_batches.fetch_add(1, std::memory_order_relaxed);
 
   // Copies [start, start + length) (dword-aligned) from guest memory.
   auto upload_bytes = [&](uint32_t start, uint32_t length) -> bool {
@@ -334,6 +335,7 @@ bool D3D12SharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(start), upload_buffer_size);
       command_list.D3DCopyBufferRegion(buffer_, start, upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
+      diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
       start += uint32_t(upload_buffer_size);
       length -= uint32_t(upload_buffer_size);
     }
@@ -387,6 +389,7 @@ bool D3D12SharedMemory::UploadRanges(
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
+      diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
@@ -447,6 +450,7 @@ bool D3D12SharedMemory::UploadRanges(
         command_list.D3DCopyBufferRegion(buffer_, page_address + i * sizeof(uint32_t),
                                          upload_buffer, UINT64(upload_buffer_offset),
                                          UINT64(upload_buffer_size));
+        diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
         i += uint32_t(upload_buffer_size / sizeof(uint32_t));
       }
     }

@@ -17,6 +17,10 @@
 
 namespace rex::graphics::diag {
 
+// Batches of guest memory uploads (each a pair of shared memory barriers), and
+// the bytes uploaded.
+inline std::atomic<uint64_t> upload_batches{0};
+inline std::atomic<uint64_t> upload_bytes{0};
 // Pages holding GPU-written (memexport/resolve) data that the CPU wrote to.
 inline std::atomic<uint64_t> cpu_writes_to_gpu_pages{0};
 // Pages uploaded by merging only the dwords the CPU changed.
@@ -191,9 +195,9 @@ inline std::string TakeTransferSummary() {
 
 inline std::string TakeSummary() {
   return fmt::format(
-      "memexport {} draws / {} KB, readback {} KB, CPU writes to GPU-written pages {}, merged "
-      "uploads {} pages / {} dwords, uploads keeping pending readback data {} ({} KB), uploads over unread memexport results {} "
-      "({} KB), {} "
+      "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB, CPU writes to "
+      "GPU-written pages {}, merged uploads {} pages / {} dwords, uploads keeping pending "
+      "readback data {} ({} KB), uploads over unread memexport results {} ({} KB), {} "
       "submissions, GPU busy {} ms, command processor GPU "
       "waits {} ms (of the GPU time: render target transfers {} ms, texture loads {} ms, "
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
@@ -203,7 +207,8 @@ inline std::string TakeSummary() {
       "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms, "
       "frames over 20/33/50 ms {}/{}/{}, longest {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
-      readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
+      readback_bytes.exchange(0) >> 10, upload_batches.exchange(0), upload_bytes.exchange(0) >> 10,
+      cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0),
       uploads_keeping_readback_data.exchange(0), upload_bytes_kept_for_readback.exchange(0) >> 10,
       uploads_over_unread_memexport.exchange(0), upload_bytes_over_unread_memexport.exchange(0) >> 10,
