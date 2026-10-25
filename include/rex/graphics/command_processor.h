@@ -173,6 +173,10 @@ class CommandProcessor {
   // observe (memory writes like fences, interrupts, swaps), so GPU results the
   // CPU may read after it can be made visible first.
   virtual void OnBeforeGuestVisibleWrite() {}
+  // Before the command processor reads guest memory the guest GPU may have
+  // written (memory polled by WAIT_REG_MEM and COND_WRITE).
+  virtual void PrepareGuestMemoryReadByGpu(uint32_t /* physical_address */,
+                                           uint32_t /* length */) {}
 
   // Asynchronous guest-visible writes: instead of waiting for the GPU before a
   // fence write or an interrupt that the CPU may follow by reading GPU results,

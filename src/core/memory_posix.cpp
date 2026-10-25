@@ -373,6 +373,8 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   return ret == 0;
 }
 
+uintptr_t GetModuleBaseOfAddress(const void* address) { return 0; }
+
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #if REX_PLATFORM_MAC
   mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(base_address);

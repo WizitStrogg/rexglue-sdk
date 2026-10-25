@@ -497,3 +497,6 @@ vmaGetAllocationInfo
 ?FlushCsv@perf@rex@@YAXXZ
 ?GetFlagByName@cvar@rex@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@V?$basic_string_view@DU?$char_traits@D@std@@@4@@Z
 ?GetRegistry@cvar@rex@@YAAEAV?$vector@UFlagEntry@cvar@rex@@V?$allocator@UFlagEntry@cvar@rex@@@std@@@std@@XZ
+?DisablePhysicalMemoryReadWatches@Memory@memory@rex@@QEAAXII@Z
+?EnablePhysicalMemoryReadWatches@Memory@memory@rex@@QEAAXII@Z
+?SetPhysicalMemoryDataProvider@Memory@memory@rex@@QEAAXP6AXPEAXII@Z0@Z

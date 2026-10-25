@@ -364,6 +364,12 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
 #endif  // REX_ARCH
 }
 
+namespace {
+thread_local uint64_t current_fault_pc_ = 0;
+}  // namespace
+
+uint64_t MMIOHandler::current_fault_pc() { return current_fault_pc_; }
+
 bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
 }
@@ -417,8 +423,11 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      current_fault_pc_ = uint64_t(ex->pc());
+      bool handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                                fault_host_address, is_write);
+      current_fault_pc_ = 0;
+      return handled;
     }
     return false;
   }

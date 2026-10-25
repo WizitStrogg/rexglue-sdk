@@ -1009,6 +1009,7 @@ bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, ui
       uint32_t value;
       if (wait_info & 0x10) {
         // The memory as the GPU sees it, with the queued writes done.
+        PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
         value = GpuSwap(LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3)),
                         static_cast<xenos::Endian>(poll_reg_addr & 0x3));
       } else {
@@ -1463,6 +1464,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
+      PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
       // With async_guest_writes_wait_lookup, writes queued asynchronously
       // earlier in the command stream are treated as already done, as they
       // are from the GPU's point of view.
@@ -1642,6 +1644,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFF, 4);
     value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {

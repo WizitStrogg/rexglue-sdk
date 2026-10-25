@@ -46,6 +46,14 @@ enum class GpuCategory : uint32_t {
   kCount,
 };
 inline std::atomic<uint64_t> gpu_category_us[size_t(GpuCategory::kCount)];
+// readback_memexport_lazy: copies issued, guest accesses to pages still being
+// copied back, those that had to wait for the GPU and the time they waited,
+// and command processor reads of such memory.
+inline std::atomic<uint64_t> lazy_readbacks{0};
+inline std::atomic<uint64_t> lazy_page_accesses{0};
+inline std::atomic<uint64_t> lazy_page_access_waits{0};
+inline std::atomic<uint64_t> lazy_page_access_wait_us{0};
+inline std::atomic<uint64_t> lazy_gpu_reads{0};
 // Command processor time spent waiting for the GPU, in microseconds.
 inline std::atomic<uint64_t> cp_gpu_wait_us{0};
 // Time the submission thread spent replaying and submitting command lists, and
@@ -151,7 +159,8 @@ inline std::string TakeSummary() {
       "waits {} ms (of the GPU time: render target transfers {} ms, texture loads {} ms, "
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
       "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
-      "(command processor waited {} ms for it)",
+      "(command processor waited {} ms for it), lazy readbacks {}, guest accesses to pages "
+      "being read back {} ({} waited, {} ms), command processor reads of them {}",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0), submissions.exchange(0),
@@ -165,7 +174,9 @@ inline std::string TakeSummary() {
       gpu_category_us[size_t(GpuCategory::kTransferDraws)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kTransferStencilClears)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kTransferStencilDraws)].exchange(0) / 1000,
-      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000) +
+      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000,
+      lazy_readbacks.exchange(0), lazy_page_accesses.exchange(0), lazy_page_access_waits.exchange(0),
+      lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0)) +
          "; " + TakeTransferSummary();
 }
 

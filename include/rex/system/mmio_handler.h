@@ -66,6 +66,10 @@ class MMIOHandler {
   bool CheckLoad(uint32_t virtual_address, uint32_t* out_value);
   bool CheckStore(uint32_t virtual_address, uint32_t value);
 
+  // Host instruction address of the access violation being handled on this
+  // thread, for diagnostics in the access violation callback.
+  static uint64_t current_fault_pc();
+
  protected:
   MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
               HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_virtual_context,

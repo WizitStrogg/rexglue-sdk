@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -320,6 +321,12 @@ class PhysicalHeap : public BaseHeap {
                         uint32_t virtual_address, uint32_t length, bool is_write,
                         bool unwatch_exact_range, bool unprotect = true);
 
+  // Read watches (see Memory::EnablePhysicalMemoryReadWatches). Return the
+  // number of system pages whose watch was enabled or disabled.
+  uint32_t EnableReadWatches(uint32_t physical_address, uint32_t length);
+  uint32_t DisableReadWatches(uint32_t physical_address, uint32_t length);
+  bool IsReadWatched(uint32_t virtual_address) const;
+
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
  protected:
@@ -336,10 +343,18 @@ class PhysicalHeap : public BaseHeap {
   uint32_t system_page_size_;
   uint32_t system_page_count_;
 
+  // Converts a physical range to the system pages of this heap covering it.
+  bool GetSystemPageRange(uint32_t physical_address, uint32_t length, uint32_t& system_page_first,
+                          uint32_t& system_page_last) const;
+
   struct SystemPageFlagsBlock {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Whether any access to each page must first call the data provider: the
+    // page is inaccessible to the guest until the provider has put the
+    // current data in memory.
+    uint64_t read_watched;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -477,10 +492,34 @@ class Memory {
   // by all the invalidation callbacks (clamped to a sane range and also not to
   // touch pages with provider callbacks) is unprotected.
   //
-  // - Data providers:
+  // - Data providers (read watches):
   //
-  // TODO(Triang3l): Implement data providers - more complicated because they
-  // will need to be able to release the global lock.
+  // Protecting from any access. For memory whose current contents are only on
+  // the host GPU while they are being copied back (results of the guest GPU
+  // writing to memory), so the guest CPU doesn't have to wait for the copy
+  // unless it actually touches the memory.
+  //
+  // Accessing a read-watched page through a guest virtual view calls the data
+  // provider, which must write the current data through the physical membase
+  // and disable the read watches of the page before returning. Then the
+  // access is retried (and a write to a page watched for invalidation is
+  // handled as such). The provider is called with the global critical region
+  // locked, and it may unlock one level of it while waiting if it locks it
+  // again before returning.
+  //
+  // Protecting, decommitting or releasing memory first provides its data.
+  typedef void (*PhysicalMemoryDataProvider)(void* context, uint32_t physical_address,
+                                             uint32_t length);
+  void SetPhysicalMemoryDataProvider(PhysicalMemoryDataProvider provider, void* context);
+  // Snapped to system page boundaries, in every guest view of the memory where
+  // it is accessible.
+  void EnablePhysicalMemoryReadWatches(uint32_t physical_address, uint32_t length);
+  // Restores the access of the pages: read-only if watched for invalidation or
+  // if the guest made them read-only, otherwise read-write.
+  void DisablePhysicalMemoryReadWatches(uint32_t physical_address, uint32_t length);
+  // Calls the data provider if any page in the range may be read-watched.
+  // Global critical region must be locked.
+  void ProvidePhysicalMemoryData(uint32_t physical_address, uint32_t length);
 
   // Returns start and length of the smallest physical memory region surrounding
   // the watched region that can be safely unwatched, if it doesn't matter,
@@ -568,6 +607,7 @@ class Memory {
 
   bool AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                void* host_address, bool is_write);
+  void LogReadWatchFault(uint32_t virtual_address, bool is_write);
   static bool AccessViolationCallbackThunk(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
@@ -624,6 +664,15 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+
+  // After the existing members, so the layout code built against the older
+  // header sees stays the same.
+  // Protected by the global critical region.
+  PhysicalMemoryDataProvider physical_memory_data_provider_ = nullptr;
+  void* physical_memory_data_provider_context_ = nullptr;
+  // Read-watched system pages in all views.
+  std::atomic<uint32_t> read_watched_page_count_{0};
+  uint32_t read_watch_faults_logged_ = 0;
 };
 
 }  // namespace rex::memory
