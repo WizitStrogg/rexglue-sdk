@@ -24,8 +24,11 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
-                    "Execute unclipped draw vertex shader on CPU");
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+                    "Execute the vertex shader of draws without clipping (primarily screen-space "
+                    "draws such as clears) on the CPU to find the EDRAM rows they use. Without "
+                    "it, such draws may claim the whole EDRAM, and each one transfers it between "
+                    "host render targets");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
                     "Execute unclipped draw VS on CPU with scissor");
