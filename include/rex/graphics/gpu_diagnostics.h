@@ -60,6 +60,15 @@ inline std::atomic<uint64_t> cp_gpu_wait_us{0};
 // time the command processor spent waiting for it.
 inline std::atomic<uint64_t> submission_thread_us{0};
 inline std::atomic<uint64_t> submission_thread_flush_us{0};
+// Frame limiter: time spent waiting for the next frame's slot and the frames
+// that waited, frames that came in late but kept the schedule, and frames so
+// late that the schedule restarted.
+inline std::atomic<uint64_t> frame_limiter_wait_us{0};
+inline std::atomic<uint64_t> frame_limiter_waits{0};
+inline std::atomic<uint64_t> frame_limiter_late_frames{0};
+inline std::atomic<uint64_t> frame_limiter_resets{0};
+// Command processor time with no guest commands to execute, in microseconds.
+inline std::atomic<uint64_t> cp_idle_us{0};
 
 // Render target ownership transfers (EDRAM data copied between host render
 // targets): count and EDRAM tiles, by source and destination render target
@@ -160,7 +169,8 @@ inline std::string TakeSummary() {
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
       "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
       "(command processor waited {} ms for it), lazy readbacks {}, guest accesses to pages "
-      "being read back {} ({} waited, {} ms), command processor reads of them {}",
+      "being read back {} ({} waited, {} ms), command processor reads of them {}, frame "
+      "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0), submissions.exchange(0),
@@ -176,7 +186,10 @@ inline std::string TakeSummary() {
       gpu_category_us[size_t(GpuCategory::kTransferStencilDraws)].exchange(0) / 1000,
       submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000,
       lazy_readbacks.exchange(0), lazy_page_accesses.exchange(0), lazy_page_access_waits.exchange(0),
-      lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0)) +
+      lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0),
+      frame_limiter_wait_us.exchange(0) / 1000, frame_limiter_waits.exchange(0),
+      frame_limiter_late_frames.exchange(0), frame_limiter_resets.exchange(0),
+      cp_idle_us.exchange(0) / 1000) +
          "; " + TakeTransferSummary();
 }
 

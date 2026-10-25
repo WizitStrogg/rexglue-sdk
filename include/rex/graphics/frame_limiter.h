@@ -7,35 +7,25 @@
 namespace rex::graphics {
 
 // Worker-thread-only host swap limiter. It neither changes the guest clock nor
-// advertises a different video mode. Late frames reset the schedule, not burst.
+// advertises a different video mode. Swaps follow a fixed schedule, so a late
+// wake-up or a slightly late frame is made up on the next frame instead of
+// lowering the rate. Frames more than half a period late restart the schedule
+// instead of bursting.
 class FrameLimiter {
  public:
   FrameLimiter() = default;
   ~FrameLimiter();
   FrameLimiter(const FrameLimiter&) = delete;
   FrameLimiter& operator=(const FrameLimiter&) = delete;
-  void Pace(int frames_per_second) {
-    if (frames_per_second <= 0 || frames_per_second > 240) {
-      rate_ = 0;
-      return;
-    }
-    auto now = Clock::now();
-    if (rate_ == frames_per_second) {
-      auto period = std::chrono::duration_cast<Clock::duration>(
-          std::chrono::duration<double>(1.0 / frames_per_second));
-      WaitUntil(previous_ + period);
-      now = Clock::now();
-    }
-    previous_ = now;
-    rate_ = frames_per_second;
-  }
+  void Pace(int frames_per_second);
 
  private:
   using Clock = std::chrono::steady_clock;
   void WaitUntil(Clock::time_point deadline);
   void* timer_ = nullptr;
   bool timer_attempted_ = false;
-  Clock::time_point previous_{};
+  // When the next swap may happen.
+  Clock::time_point deadline_{};
   int rate_ = 0;
 };
 

@@ -389,6 +389,11 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      diag::cp_idle_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - idle_start)
+                       .count()),
+          std::memory_order_relaxed);
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
