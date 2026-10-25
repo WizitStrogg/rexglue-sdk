@@ -21,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -36,6 +37,25 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
+
+REXCVAR_DEFINE_BOOL(skip_redundant_stencil_transfers, true, "GPU",
+                    "With host render targets, when transferring EDRAM data to a depth render "
+                    "target that still holds the same stencil (it gave the range away and only "
+                    "depth or nothing has been written since, such as depth switching between "
+                    "1x and 4x MSAA), copy only the depth and keep the stencil.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skip_unconsumed_stencil_transfers, true, "GPU",
+                    "With host render targets, don't copy the stencil in depth render target "
+                    "transfers until a draw that uses the stencil values (stencil test other "
+                    "than always, or increment / decrement / invert operations) is seen. From "
+                    "then on, stencil is copied.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skip_redundant_render_target_transfers, true, "GPU",
+                    "With host render targets, don't transfer EDRAM data back to a render "
+                    "target that still holds it: the range's owner got it from that render "
+                    "target and hasn't written to it since (such as depth switching between "
+                    "1x and 4x MSAA with only depth testing in one of them)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
@@ -334,6 +354,12 @@ RenderTargetCache::~RenderTargetCache() {
 }
 
 void RenderTargetCache::InitializeCommon() {
+  diag::describe_render_target_key = [](uint32_t key_without_base_pitch) -> std::string {
+    RenderTargetKey key;
+    key.key = key_without_base_pitch << 19;
+    return fmt::format("{}{} {}x", key.is_depth ? "depth " : "", key.GetFormatName(),
+                       uint32_t(1) << uint32_t(key.msaa_samples));
+  };
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -693,6 +719,119 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   if (interlock_barrier_only) {
     // No copying transfers or render target bindings - only needed the barrier.
     return true;
+  }
+
+  // The previous owners of the ranges the draw writes no longer hold the same
+  // data. Also track the stencil bits that may become non-zero.
+  uint32_t draw_stencil_bits = 0;
+  bool draw_writes_stencil = false;
+  if (normalized_depth_control.stencil_enable) {
+    auto face_writes_stencil = [](xenos::StencilOp fail, xenos::StencilOp zpass,
+                                  xenos::StencilOp zfail, reg::RB_STENCILREFMASK ref_mask) {
+      return ref_mask.stencilwritemask &&
+             (fail != xenos::StencilOp::kKeep || zpass != xenos::StencilOp::kKeep ||
+              zfail != xenos::StencilOp::kKeep);
+    };
+    draw_writes_stencil = face_writes_stencil(
+        normalized_depth_control.stencilfail, normalized_depth_control.stencilzpass,
+        normalized_depth_control.stencilzfail, regs.Get<reg::RB_STENCILREFMASK>());
+    if (normalized_depth_control.backface_enable) {
+      draw_writes_stencil |= face_writes_stencil(
+          normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzpass_bf,
+          normalized_depth_control.stencilzfail_bf,
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF));
+    }
+    auto get_face_stencil_bits = [](xenos::StencilOp fail, xenos::StencilOp zpass,
+                                    xenos::StencilOp zfail, reg::RB_STENCILREFMASK ref_mask) {
+      uint32_t bits = 0;
+      for (xenos::StencilOp op : {fail, zpass, zfail}) {
+        switch (op) {
+          case xenos::StencilOp::kKeep:
+          case xenos::StencilOp::kZero:
+            break;
+          case xenos::StencilOp::kReplace:
+            bits |= ref_mask.stencilref;
+            break;
+          default:
+            bits |= 0xFF;
+            break;
+        }
+      }
+      return bits & ref_mask.stencilwritemask;
+    };
+    draw_stencil_bits = get_face_stencil_bits(
+        normalized_depth_control.stencilfail, normalized_depth_control.stencilzpass,
+        normalized_depth_control.stencilzfail, regs.Get<reg::RB_STENCILREFMASK>());
+    if (normalized_depth_control.backface_enable) {
+      draw_stencil_bits |= get_face_stencil_bits(
+          normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzpass_bf,
+          normalized_depth_control.stencilzfail_bf,
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF));
+    }
+  }
+  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+    uint32_t rt_bit_index = edram_bases_sorted[i].second;
+    bool writes;
+    bool writes_stencil;
+    if (rt_bit_index) {
+      writes = ((normalized_color_mask >> ((rt_bit_index - 1) * 4)) & 0xF) != 0;
+      writes_stencil = writes;
+      if (writes) {
+        // Anything in the depth / stencil interpretation.
+        UpdateOwnershipRangeStencilBits(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i], 0xFF,
+                                        false);
+      }
+    } else {
+      writes = (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
+               normalized_depth_control.stencil_enable;
+      writes_stencil = draw_writes_stencil;
+      if (normalized_depth_control.stencil_enable && !stencil_values_consumed_) {
+        auto face_consumes_stencil = [](xenos::CompareFunction func, xenos::StencilOp fail,
+                                        xenos::StencilOp zpass, xenos::StencilOp zfail) {
+          if (func != xenos::CompareFunction::kAlways) {
+            return true;
+          }
+          for (xenos::StencilOp op : {fail, zpass, zfail}) {
+            if (op != xenos::StencilOp::kKeep && op != xenos::StencilOp::kZero &&
+                op != xenos::StencilOp::kReplace) {
+              return true;
+            }
+          }
+          return false;
+        };
+        bool consumes = face_consumes_stencil(
+            normalized_depth_control.stencilfunc, normalized_depth_control.stencilfail,
+            normalized_depth_control.stencilzpass, normalized_depth_control.stencilzfail);
+        if (normalized_depth_control.backface_enable) {
+          consumes |= face_consumes_stencil(
+              normalized_depth_control.stencilfunc_bf, normalized_depth_control.stencilfail_bf,
+              normalized_depth_control.stencilzpass_bf, normalized_depth_control.stencilzfail_bf);
+        }
+        if (consumes) {
+          stencil_values_consumed_ = true;
+          REXGPU_INFO(
+              "RenderTargetCache: A draw uses the stencil values (RB_DEPTHCONTROL {:08X}), "
+              "copying the stencil in render target transfers from now on",
+              normalized_depth_control.value);
+        }
+      }
+      if (draw_writes_stencil) {
+        diag::stencil_write_draws.fetch_add(1, std::memory_order_relaxed);
+        diag::draw_stencil_bits_or.fetch_or(draw_stencil_bits, std::memory_order_relaxed);
+      }
+      diag::depth_draws_by_stencil_use
+          [rt_keys[rt_bit_index].msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0]
+          [draw_writes_stencil ? 2 : (normalized_depth_control.stencil_enable ? 1 : 0)]
+              .fetch_add(1, std::memory_order_relaxed);
+      if (draw_stencil_bits) {
+        UpdateOwnershipRangeStencilBits(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                                        draw_stencil_bits, false);
+      }
+    }
+    if (writes) {
+      MarkOwnershipRangeWritten(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                                writes_stencil ? (rt_bit_index ? 1 : 2) : 0);
+    }
   }
 
   // If everything succeeded, update the used render targets.
@@ -1111,15 +1250,35 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   clear_rectangle_out = clear_rectangle;
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
+  // Whether the clear fully covers the EDRAM tiles of its extent, so the
+  // stencil bits there are exactly those of the clear value.
+  uint32_t clear_tile_height_pixels = xenos::kEdramTileHeightSamples >> msaa_samples_y_log2;
+  bool clear_covers_whole_tiles =
+      !clear_rectangle.x_pixels && clear_rectangle.width_pixels == pitch_pixels &&
+      !(clear_rectangle.y_pixels % clear_tile_height_pixels) &&
+      !(clear_rectangle.height_pixels % clear_tile_height_pixels);
   if (depth_render_target) {
     ChangeOwnership(depth_render_target_key, depth_clear_start_tiles_base_relative,
                     depth_clear_length_tiles, &depth_transfers_out, &clear_rectangle);
+    MarkOwnershipRangeWritten(depth_render_target_key, depth_clear_start_tiles_base_relative,
+                              depth_clear_length_tiles, 3);
+    UpdateOwnershipRangeStencilBits(depth_render_target_key, depth_clear_start_tiles_base_relative,
+                                    depth_clear_length_tiles, resolve_info.rb_depth_clear & 0xFF,
+                                    clear_covers_whole_tiles);
   }
   color_render_target_out = color_render_target;
   color_transfers_out.clear();
   if (color_render_target) {
     ChangeOwnership(color_render_target_key, color_clear_start_tiles_base_relative,
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
+    MarkOwnershipRangeWritten(color_render_target_key, color_clear_start_tiles_base_relative,
+                              color_clear_length_tiles, 3);
+    // With 32bpp, the stencil in the depth / stencil interpretation is the low
+    // 8 bits of the value.
+    UpdateOwnershipRangeStencilBits(
+        color_render_target_key, color_clear_start_tiles_base_relative, color_clear_length_tiles,
+        resolve_info.color_edram_info.format_is_64bpp ? 0xFF : (resolve_info.rb_color_clear & 0xFF),
+        clear_covers_whole_tiles && !resolve_info.color_edram_info.format_is_64bpp);
   }
   return true;
 }
@@ -1173,6 +1332,73 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_targets_.emplace(key, render_target);
   }
   return render_target;
+}
+
+bool RenderTargetCache::AreStencilTransfersNeeded() const {
+  return stencil_values_consumed_ || !REXCVAR_GET(skip_unconsumed_stencil_transfers);
+}
+
+void RenderTargetCache::UpdateOwnershipRangeStencilBits(RenderTargetKey key,
+                                                        uint32_t start_tiles_base_relative,
+                                                        uint32_t length_tiles, uint32_t bits,
+                                                        bool assign) {
+  if (!length_tiles) {
+    return;
+  }
+  bits &= 0xFF;
+  auto update_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+    auto it = ownership_ranges_.lower_bound(extent_start);
+    if (it != ownership_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != ownership_ranges_.end() && it->first < extent_end; ++it) {
+      if (assign && it->first >= extent_start && it->second.end_tiles <= extent_end) {
+        it->second.stencil_bits = bits;
+      } else {
+        it->second.stencil_bits |= bits;
+      }
+    }
+  };
+  uint32_t start_tiles = (key.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  update_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    update_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
+}
+
+void RenderTargetCache::MarkOwnershipRangeWritten(RenderTargetKey key,
+                                                  uint32_t start_tiles_base_relative,
+                                                  uint32_t length_tiles,
+                                                  uint8_t stencil_reset_reason) {
+  if (!length_tiles) {
+    return;
+  }
+  auto mark_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+    auto it = ownership_ranges_.lower_bound(extent_start);
+    if (it != ownership_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != ownership_ranges_.end() && it->first < extent_end; ++it) {
+      // Conservatively for the whole range even if it's partially outside.
+      it->second.clean_source = RenderTargetKey();
+      if (stencil_reset_reason) {
+        it->second.ResetStencilCleanSources(stencil_reset_reason);
+      }
+    }
+  };
+  uint32_t start_tiles = (key.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  mark_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+  if (end_tiles > xenos::kEdramTileCount) {
+    mark_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
 }
 
 bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
@@ -1294,9 +1520,33 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         // Only perform the copying when actually changing the latest owner, not
         // just the latest host depth owner - the transfer source is expected to
         // be different than the destination.
+        bool transfer_redundant = false;
         if (!transfer_source.IsEmpty() && transfer_source != dest) {
           uint32_t transfer_end_tiles = std::min(it->second.end_tiles, extent_end);
-          if (!resolve_clear_cutout ||
+          if (it->second.clean_source == dest) {
+            // The destination still holds this data from when it gave the
+            // range to the current owner, which hasn't written to it since.
+            diag::redundant_transfer_tiles.fetch_add(transfer_end_tiles - it->first,
+                                                     std::memory_order_relaxed);
+            transfer_redundant = REXCVAR_GET(skip_redundant_render_target_transfers);
+          }
+          bool transfer_stencil_unchanged =
+              dest.is_depth && it->second.IsStencilCleanIn(dest) &&
+              REXCVAR_GET(skip_redundant_stencil_transfers);
+          if (dest.is_depth && !transfer_redundant) {
+            diag::RecordStencilTransfer(
+                transfer_stencil_unchanged
+                    ? 0
+                    : (it->second.stencil_clean_sources[0].IsEmpty()
+                           ? it->second.stencil_reset_reason
+                           : 4),
+                transfer_end_tiles - it->first);
+          }
+          if (!transfer_redundant) {
+            diag::RecordTransfer(transfer_source.key, dest.key, transfer_end_tiles - it->first);
+          }
+          if (transfer_redundant) {
+          } else if (!resolve_clear_cutout ||
               Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
                                            dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
                                            nullptr, resolve_clear_cutout)) {
@@ -1311,6 +1561,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
             if (!transfers_append_out->empty() &&
                 transfers_append_out->back().end_tiles == it->first &&
                 transfers_append_out->back().source->key() == transfer_source &&
+                transfers_append_out->back().stencil_unchanged == transfer_stencil_unchanged &&
                 ((transfers_append_out->back().host_depth_source == nullptr) ==
                  transfer_host_depth_source.IsEmpty()) &&
                 (transfer_host_depth_source.IsEmpty() ||
@@ -1319,6 +1570,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
               // Extend the last transfer if, for example, transferring color,
               // but host depth is different.
               transfers_append_out->back().end_tiles = transfer_end_tiles;
+              transfers_append_out->back().stencil_bits |= it->second.stencil_bits;
             } else {
               auto transfer_source_rt_it = render_targets_.find(transfer_source);
               if (transfer_source_rt_it != render_targets_.end()) {
@@ -1335,7 +1587,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                       it->first, transfer_end_tiles, transfer_source_rt_it->second,
                       transfer_host_depth_source_rt_it != render_targets_.end()
                           ? transfer_host_depth_source_rt_it->second
-                          : nullptr);
+                          : nullptr,
+                      it->second.stencil_bits, transfer_stencil_unchanged);
                 }
               }
             }
@@ -1343,6 +1596,20 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
         }
       }
       // Claim the current range.
+      if (transfers_append_out) {
+        RenderTargetKey previous_owner = it->second.render_target;
+        if (previous_owner != dest) {
+          // The previous owner keeps the data that is now in the destination
+          // (transferred, or already there).
+          it->second.clean_source = previous_owner;
+          // Same for the stencil, which the depth render targets that held it
+          // keep too.
+          it->second.MoveStencilCleanSources(previous_owner, dest);
+        }
+      } else {
+        it->second.clean_source = RenderTargetKey();
+        it->second.ResetStencilCleanSources(6);
+      }
       it->second.render_target = dest;
       if (host_depth_encoding_different) {
         it->second.GetHostDepthRenderTarget(dest.GetDepthFormat()) = dest;

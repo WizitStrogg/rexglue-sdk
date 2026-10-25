@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -20,6 +21,7 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -46,6 +48,22 @@ REXCVAR_DEFINE_BOOL(readback_memexport_deferred, true, "GPU/D3D12",
                     "the CPU current data without stalling the GPU per draw. Overrides "
                     "readback_memexport_fast.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
+                    "With readback_memexport_deferred, don't wait for the GPU before fence "
+                    "writes and interrupts. Copy the memexport results back asynchronously and "
+                    "delay those writes until the copy has completed, keeping the command "
+                    "processor and the GPU working in parallel.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_submission_thread, false, "GPU/D3D12",
+                    "Replay and submit command lists on a separate thread, so the graphics "
+                    "driver's work runs in parallel with command processing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamps, false, "GPU/D3D12",
+                    "Measure the host GPU time of each submission with timestamp queries "
+                    "(for the performance diagnostics log)");
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
@@ -921,6 +939,11 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  submission_thread_exit_ = false;
+  submission_thread_busy_ = false;
+  submission_thread_list_ = std::make_unique<DeferredCommandList>(*this, 0);
+  submission_thread_ = std::thread([this]() { SubmissionThreadMain(); });
+
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -1634,6 +1657,9 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  if (REXCVAR_GET(d3d12_gpu_timestamps)) {
+    InitializeTimestampResources();
+  }
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1642,11 +1668,29 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  FlushSubmissionThread();
   AwaitAllQueueOperationsCompletion();
+  if (submission_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(submission_mutex_);
+      submission_thread_exit_ = true;
+    }
+    submission_work_cond_.notify_all();
+    submission_thread_.join();
+  }
+  submission_thread_list_.reset();
+  submission_free_streams_.clear();
   memexport_readback_deferred_ranges_.clear();
   memexport_readback_deferred_size_ = 0;
+  async_guest_writes_.clear();
+  for (AsyncReadbackBuffer& readback : async_readback_buffers_) {
+    readback.buffer->Unmap(0, nullptr);
+    readback.buffer->Release();
+  }
+  async_readback_buffers_.clear();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  ShutdownTimestampResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -2265,6 +2309,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // queue.
         SubmitBarriers();
         EndSubmission(true);
+        // The presenter signals its fence on the queue right after this.
+        FlushSubmissionThread();
         return true;
       });
 
@@ -2381,10 +2427,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  GpuProfileScope transfers_profile_scope = BeginGpuProfileScope();
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  EndGpuProfileScope(transfers_profile_scope, diag::GpuCategory::kRenderTargetTransfers);
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -2432,7 +2480,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  GpuProfileScope textures_profile_scope = BeginGpuProfileScope();
   texture_cache_->RequestTextures(used_texture_mask);
+  EndGpuProfileScope(textures_profile_scope, diag::GpuCategory::kTextureLoads);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2736,6 +2786,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
+    diag::memexport_draws.fetch_add(1, std::memory_order_relaxed);
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      diag::memexport_bytes.fetch_add(memexport_range.size_bytes, std::memory_order_relaxed);
+    }
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
         !memexport_ranges_.empty()) {
       uint32_t memexport_total_size = 0;
@@ -2788,8 +2842,88 @@ void D3D12CommandProcessor::FlushDeferredMemexportReadback() {
 void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() { FlushDeferredMemexportReadback(); }
 
 void D3D12CommandProcessor::PrepareForWait() {
-  FlushDeferredMemexportReadback();
+  // The asynchronous writes are older than the deferred ranges.
   CommandProcessor::PrepareForWait();
+  FlushDeferredMemexportReadback();
+}
+
+uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
+  if (memexport_readback_deferred_ranges_.empty() || !REXCVAR_GET(readback_memexport_async) ||
+      !submission_open_) {
+    return 0;
+  }
+  uint32_t total_size = memexport_readback_deferred_size_;
+
+  AsyncReadbackBuffer* readback = nullptr;
+  for (AsyncReadbackBuffer& buffer : async_readback_buffers_) {
+    if (!buffer.in_use && buffer.size >= total_size &&
+        (!readback || buffer.size < readback->size)) {
+      readback = &buffer;
+    }
+  }
+  if (!readback) {
+    uint32_t size = std::max(uint32_t(1) << 16, total_size);
+    size = std::bit_ceil(size);
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* buffer;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      return 0;
+    }
+    D3D12_RANGE read_range = {0, size};
+    void* mapping;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      buffer->Release();
+      return 0;
+    }
+    async_readback_buffers_.push_back({buffer, mapping, size, false});
+    readback = &async_readback_buffers_.back();
+  }
+  readback->in_use = true;
+  diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
+  size_t readback_index = size_t(readback - async_readback_buffers_.data());
+
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_readback_deferred_ranges_) {
+    deferred_command_list_.D3DCopyBufferRegion(readback->buffer, readback_offset,
+                                               shared_memory_buffer,
+                                               memexport_range.base_address_dwords << 2,
+                                               memexport_range.size_bytes);
+    readback_offset += memexport_range.size_bytes;
+  }
+
+  // Submit now so the GPU starts on it while the command processor goes on.
+  uint64_t token = submission_current_;
+  EndSubmission(false);
+
+  QueueAsyncGuestVisibleWrite(
+      token, [this, readback_index, ranges = std::move(memexport_readback_deferred_ranges_)]() {
+        AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
+        const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
+        for (const draw_util::MemExportRange& memexport_range : ranges) {
+          std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                      readback_bytes, memexport_range.size_bytes);
+          readback_bytes += memexport_range.size_bytes;
+        }
+        readback.in_use = false;
+      });
+  memexport_readback_deferred_ranges_.clear();
+  memexport_readback_deferred_size_ = 0;
+  return token;
+}
+
+bool D3D12CommandProcessor::IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) {
+  if (submission_completed_ >= token) {
+    return true;
+  }
+  CheckSubmissionFence(wait ? token : 0);
+  return submission_completed_ >= token;
 }
 
 bool D3D12CommandProcessor::MemexportReadbackFullPath(
@@ -2802,6 +2936,7 @@ bool D3D12CommandProcessor::MemexportReadbackFullPath(
   if (!readback_buffer) {
     return true;
   }
+  diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
 
   shared_memory_->UseAsCopySource();
   SubmitBarriers();
@@ -2955,8 +3090,11 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    GpuProfileScope resolve_profile_scope = BeginGpuProfileScope();
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    EndGpuProfileScope(resolve_profile_scope, diag::GpuCategory::kResolves);
+    return resolved;
   }
   return IssueCopy_ReadbackResolvePath();
 }
@@ -3177,6 +3315,70 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   return true;
 }
 
+void D3D12CommandProcessor::FlushSubmissionThread() {
+  if (!submission_thread_.joinable()) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_mutex_);
+  if (submission_jobs_.empty() && !submission_thread_busy_) {
+    return;
+  }
+  const auto wait_start = std::chrono::steady_clock::now();
+  submission_idle_cond_.wait(lock,
+                             [this]() { return submission_jobs_.empty() && !submission_thread_busy_; });
+  diag::submission_thread_flush_us.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - wait_start)
+                   .count()),
+      std::memory_order_relaxed);
+}
+
+void D3D12CommandProcessor::ExecuteSubmissionJob(SubmissionJob& job, DeferredCommandList& list) {
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  list.SwapStream(job.stream);
+  job.command_allocator->Reset();
+  command_list_->Reset(job.command_allocator, nullptr);
+  list.Execute(command_list_, command_list_1_);
+  command_list_->Close();
+  ID3D12CommandList* execute_command_lists[] = {command_list_};
+  direct_queue->ExecuteCommandLists(1, execute_command_lists);
+  direct_queue->Signal(submission_fence_, job.fence_value);
+  list.SwapStream(job.stream);
+  job.stream.clear();
+}
+
+void D3D12CommandProcessor::SubmissionThreadMain() {
+  SetThreadDescription(GetCurrentThread(), L"GPU Submission");
+  std::unique_lock<std::mutex> lock(submission_mutex_);
+  while (true) {
+    submission_work_cond_.wait(
+        lock, [this]() { return submission_thread_exit_ || !submission_jobs_.empty(); });
+    if (submission_jobs_.empty()) {
+      if (submission_thread_exit_) {
+        return;
+      }
+      continue;
+    }
+    SubmissionJob job = std::move(submission_jobs_.front());
+    submission_jobs_.pop_front();
+    submission_thread_busy_ = true;
+    lock.unlock();
+    const auto start = std::chrono::steady_clock::now();
+    ExecuteSubmissionJob(job, *submission_thread_list_);
+    diag::submission_thread_us.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count()),
+        std::memory_order_relaxed);
+    lock.lock();
+    submission_free_streams_.push_back(std::move(job.stream));
+    submission_thread_busy_ = false;
+    if (submission_jobs_.empty()) {
+      submission_idle_cond_.notify_all();
+    }
+  }
+}
+
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (await_submission >= submission_current_) {
     if (submission_open_) {
@@ -3187,6 +3389,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // submission, but just in case of a failure, or queue operations being done
     // outside of a submission, await explicitly.
     if (queue_operations_done_since_submission_signal_) {
+      FlushSubmissionThread();
       UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
       if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
@@ -3212,7 +3415,13 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
+      const auto wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      diag::cp_gpu_wait_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count()),
+          std::memory_order_relaxed);
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3223,6 +3432,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // Not updated - no need to reclaim or download things.
     return;
   }
+
+  CollectTimestamps(submission_completed_before, submission_completed_);
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -3378,6 +3589,16 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // fulfilled).
     deferred_command_list_.Reset();
 
+    if (timestamp_query_heap_) {
+      uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+      timestamp_slot.submission = submission_current_;
+      timestamp_slot.used = 2;
+      timestamp_slot.scopes.clear();
+      deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                         slot * kTimestampsPerSubmission);
+    }
+
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3489,6 +3710,18 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // destroyed between frames.
     SubmitBarriers();
 
+    if (timestamp_query_heap_) {
+      uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+      const TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+      uint32_t slot_first = slot * kTimestampsPerSubmission;
+      deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                         slot_first + 1);
+      deferred_command_list_.D3DResolveQueryData(
+          timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_first,
+          timestamp_slot.used, timestamp_readback_.Get(), sizeof(uint64_t) * slot_first);
+    }
+    diag::submissions.fetch_add(1, std::memory_order_relaxed);
+
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
     // Submit the deferred command list.
@@ -3498,12 +3731,35 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    if (REXCVAR_GET(d3d12_submission_thread) && submission_thread_.joinable()) {
+      SubmissionJob job;
+      job.command_allocator = command_allocator;
+      job.fence_value = submission_current_;
+      {
+        std::lock_guard<std::mutex> lock(submission_mutex_);
+        if (!submission_free_streams_.empty()) {
+          job.stream = std::move(submission_free_streams_.back());
+          submission_free_streams_.pop_back();
+        }
+      }
+      job.stream.clear();
+      deferred_command_list_.SwapStream(job.stream);
+      {
+        std::lock_guard<std::mutex> lock(submission_mutex_);
+        submission_jobs_.push_back(std::move(job));
+      }
+      submission_work_cond_.notify_one();
+    } else {
+      // Keep the order with what was given to the submission thread before.
+      FlushSubmissionThread();
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      deferred_command_list_.Execute(command_list_, command_list_1_);
+      command_list_->Close();
+      ID3D12CommandList* execute_command_lists[] = {command_list_};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+      direct_queue->Signal(submission_fence_, submission_current_);
+    }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -3517,7 +3773,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
+    ++submission_current_;
 
     submission_open_ = false;
 
@@ -4949,6 +5205,127 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
   occlusion_query_resources_available_ = true;
   return true;
+}
+
+void D3D12CommandProcessor::InitializeTimestampResources() {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !direct_queue || FAILED(direct_queue->GetTimestampFrequency(&timestamp_frequency_)) ||
+      !timestamp_frequency_) {
+    return;
+  }
+  D3D12_QUERY_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count = kTimestampSubmissionSlots * kTimestampsPerSubmission;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&timestamp_query_heap_)))) {
+    return;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, sizeof(uint64_t) * kTimestampSubmissionSlots * kTimestampsPerSubmission,
+      D3D12_RESOURCE_FLAG_NONE);
+  void* mapping = nullptr;
+  D3D12_RANGE read_range = {0,
+                            sizeof(uint64_t) * kTimestampSubmissionSlots * kTimestampsPerSubmission};
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&timestamp_readback_))) ||
+      FAILED(timestamp_readback_->Map(0, &read_range, &mapping))) {
+    timestamp_readback_.Reset();
+    timestamp_query_heap_.Reset();
+    return;
+  }
+  timestamp_readback_mapping_ = static_cast<const uint64_t*>(mapping);
+  for (TimestampSlot& timestamp_slot : timestamp_slots_) {
+    timestamp_slot = {};
+  }
+}
+
+void D3D12CommandProcessor::ShutdownTimestampResources() {
+  if (timestamp_readback_ && timestamp_readback_mapping_) {
+    timestamp_readback_->Unmap(0, nullptr);
+  }
+  timestamp_readback_mapping_ = nullptr;
+  timestamp_readback_.Reset();
+  timestamp_query_heap_.Reset();
+}
+
+void D3D12CommandProcessor::CollectTimestamps(uint64_t completed_before, uint64_t completed_now) {
+  if (!timestamp_readback_mapping_ || completed_now <= completed_before) {
+    return;
+  }
+  uint64_t first = std::max(completed_before + 1, completed_now >= kTimestampSubmissionSlots
+                                                      ? completed_now - kTimestampSubmissionSlots + 1
+                                                      : uint64_t(1));
+  uint64_t busy_ticks = 0;
+  uint64_t category_ticks[size_t(diag::GpuCategory::kCount)] = {};
+  for (uint64_t submission = first; submission <= completed_now; ++submission) {
+    uint32_t slot = uint32_t(submission % kTimestampSubmissionSlots);
+    const TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+    if (timestamp_slot.submission != submission) {
+      continue;
+    }
+    const uint64_t* queries = timestamp_readback_mapping_ + slot * kTimestampsPerSubmission;
+    if (queries[1] > queries[0]) {
+      busy_ticks += queries[1] - queries[0];
+    }
+    for (const auto& scope : timestamp_slot.scopes) {
+      uint64_t begin = queries[scope.second];
+      uint64_t end = queries[scope.second + 1];
+      if (end > begin) {
+        category_ticks[scope.first] += end - begin;
+      }
+    }
+  }
+  diag::gpu_busy_us.fetch_add(busy_ticks * 1000000 / timestamp_frequency_,
+                              std::memory_order_relaxed);
+  for (size_t i = 0; i < size_t(diag::GpuCategory::kCount); ++i) {
+    diag::gpu_category_us[i].fetch_add(category_ticks[i] * 1000000 / timestamp_frequency_,
+                                       std::memory_order_relaxed);
+  }
+}
+
+D3D12CommandProcessor::GpuProfileScope D3D12CommandProcessor::BeginGpuProfileScope() {
+  GpuProfileScope scope;
+  if (!timestamp_query_heap_ || !submission_open_) {
+    return scope;
+  }
+  uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+  TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+  if (timestamp_slot.submission != submission_current_ ||
+      timestamp_slot.used + 2 > kTimestampsPerSubmission) {
+    return scope;
+  }
+  scope.query_index = timestamp_slot.used;
+  scope.submission = submission_current_;
+  scope.stream_size_before = deferred_command_list_.GetStreamSize();
+  deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     slot * kTimestampsPerSubmission + scope.query_index);
+  scope.stream_size_after_query = deferred_command_list_.GetStreamSize();
+  timestamp_slot.used += 2;
+  return scope;
+}
+
+void D3D12CommandProcessor::EndGpuProfileScope(const GpuProfileScope& scope,
+                                               diag::GpuCategory category) {
+  if (scope.query_index == UINT32_MAX || scope.submission != submission_current_ ||
+      !submission_open_) {
+    return;
+  }
+  uint32_t slot = uint32_t(submission_current_ % kTimestampSubmissionSlots);
+  TimestampSlot& timestamp_slot = timestamp_slots_[slot];
+  if (deferred_command_list_.GetStreamSize() == scope.stream_size_after_query) {
+    // Nothing recorded - drop the query, keeping the list of queries dense.
+    if (timestamp_slot.used == scope.query_index + 2) {
+      deferred_command_list_.TruncateStream(scope.stream_size_before);
+      timestamp_slot.used -= 2;
+      return;
+    }
+  }
+  deferred_command_list_.D3DEndQuery(timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     slot * kTimestampsPerSubmission + scope.query_index + 1);
+  timestamp_slot.scopes.emplace_back(uint32_t(category), scope.query_index);
 }
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {

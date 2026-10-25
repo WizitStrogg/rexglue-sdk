@@ -12,7 +12,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -172,6 +174,30 @@ class CommandProcessor {
   // CPU may read after it can be made visible first.
   virtual void OnBeforeGuestVisibleWrite() {}
 
+  // Asynchronous guest-visible writes: instead of waiting for the GPU before a
+  // fence write or an interrupt that the CPU may follow by reading GPU results,
+  // the backend can schedule those results to be copied back and return a
+  // token, and the write itself is queued and done once the token completes,
+  // in order, while the command processor keeps going.
+  // Returns 0 when the write can be done immediately.
+  virtual uint64_t PrepareAsyncGuestVisibleWrite() { return 0; }
+  // Whether the GPU work for the token has completed, waiting for it if
+  // `wait` is true.
+  virtual bool IsAsyncGuestVisibleWriteReady(uint64_t /* token */, bool /* wait */) {
+    return true;
+  }
+  void QueueAsyncGuestVisibleWrite(uint64_t token, std::function<void()> write,
+                                   std::vector<std::pair<uint32_t, uint32_t>> stores = {});
+  // Does the queued writes whose GPU work has completed (or all, waiting for
+  // the GPU, if `wait` is true).
+  void FlushAsyncGuestVisibleWrites(bool wait);
+  bool HasAsyncGuestVisibleWrites() const { return !async_guest_writes_.empty(); }
+  // Executes a fence write or an interrupt packet asynchronously if needed.
+  // Returns false if the packet must be executed normally instead.
+  static bool CompareWaitValue(uint32_t wait_info, uint32_t value, uint32_t mask, uint32_t ref);
+  bool TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode, uint32_t count,
+                                  bool* result);
+
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
@@ -256,6 +282,59 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  struct AsyncGuestVisibleWrite {
+    uint64_t token;
+    std::function<void()> write;
+    // Memory words the write stores (physical address of the dword, value as
+    // stored in memory), so command processor waits can see them early, as
+    // the GPU would have written them by then. `expected` is the value the
+    // GPU saw there when the write was queued: if the memory holds something
+    // else when the write is done, the CPU has written it since, and the
+    // CPU's newer value is kept.
+    struct Store {
+      uint32_t address;
+      uint32_t value;
+      uint32_t expected;
+    };
+    std::vector<Store> stores;
+  };
+  // Returns the value of a memory dword as the GPU sees it at this point of
+  // the command stream, including queued asynchronous writes.
+  uint32_t LoadMemoryForGpu(uint32_t physical_address_dword, bool* from_queue = nullptr) const;
+  std::deque<AsyncGuestVisibleWrite> async_guest_writes_;
+  uint32_t async_guest_writes_poll_counter_ = 0;
+  // Diagnostic counts of guest-visible packets, logged every few seconds.
+  struct AsyncGuestWriteDiag {
+    uint64_t interrupts = 0;
+    uint64_t mem_writes = 0;
+    uint64_t counter_events = 0;
+    uint64_t value_events = 0;
+    uint64_t counter_immediate = 0;
+    uint64_t immediate = 0;
+    uint64_t drains = 0;
+    uint64_t wait_queue_hits = 0;
+    uint64_t wait_drains = 0;
+    uint64_t swaps = 0;
+    uint64_t stores_kept_cpu_value = 0;
+    uint64_t cond_writes = 0;
+  } async_diag_;
+  std::chrono::steady_clock::time_point async_diag_last_log_ = std::chrono::steady_clock::now();
+  void LogAsyncGuestWriteDiag();
+  // Last EVENT_WRITE_SHD of each kind (physical dword address, value written),
+  // logged if the command processor stays idle long, to diagnose guest hangs
+  // waiting for a GPU fence or counter.
+  uint32_t last_shd_counter_address_ = 0;
+  uint32_t last_shd_counter_value_ = 0;
+  xenos::Endian last_shd_counter_endian_ = xenos::Endian::kNone;
+  // Idle-time refreshes of the counter in guest memory (see the cvar).
+  uint32_t idle_counter_refreshes_ = 0;
+  void RefreshCounterWhileIdle();
+  uint32_t last_shd_value_address_ = 0;
+  uint32_t last_shd_value_value_ = 0;
+  uint32_t last_wait_reg_mem_address_ = 0;
+  uint32_t last_wait_reg_mem_reference_ = 0;
+  void LogIdleStall(std::chrono::steady_clock::duration idle_time);
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

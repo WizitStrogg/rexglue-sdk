@@ -14,10 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -25,6 +28,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
@@ -59,6 +63,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
+
+  // Measures the host GPU time of the work recorded in the scope for the
+  // diagnostics log, with d3d12_gpu_timestamps.
+  struct GpuProfileScope {
+    uint32_t query_index = UINT32_MAX;
+    size_t stream_size_before = 0;
+    size_t stream_size_after_query = 0;
+    uint64_t submission = 0;
+  };
+  GpuProfileScope BeginGpuProfileScope();
+  void EndGpuProfileScope(const GpuProfileScope& scope, diag::GpuCategory category);
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -213,6 +228,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
 
   void OnBeforeGuestVisibleWrite() override;
+  uint64_t PrepareAsyncGuestVisibleWrite() override;
+  bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
   void PrepareForWait() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -463,6 +480,32 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_writable_last_ = nullptr;
   CommandAllocator* command_allocator_submitted_first_ = nullptr;
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
+  // Submission thread (d3d12_submission_thread): replays deferred command
+  // lists into the D3D12 command list and submits them, so the driver's work
+  // happens in parallel with the command processor.
+  struct SubmissionJob {
+    std::vector<uintmax_t> stream;
+    ID3D12CommandAllocator* command_allocator;
+    uint64_t fence_value;
+  };
+  std::thread submission_thread_;
+  std::mutex submission_mutex_;
+  std::condition_variable submission_work_cond_;
+  std::condition_variable submission_idle_cond_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  bool submission_thread_busy_ = false;
+  bool submission_thread_exit_ = false;
+  std::unique_ptr<DeferredCommandList> submission_thread_list_;
+  void SubmissionThreadMain();
+  void ExecuteSubmissionJob(SubmissionJob& job, DeferredCommandList& list);
+
+ public:
+  // Waits until the submission thread has submitted everything given to it,
+  // before something else is submitted to the queue that must come after it.
+  void FlushSubmissionThread();
+
+ private:
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
@@ -656,6 +699,28 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
+  // GPU timestamps at the beginning and the end of each submission, and around
+  // categories of emulation work in it, for measuring host GPU time
+  // (gpu_diagnostics.h). Queries of a submission are at
+  // [slot * kTimestampsPerSubmission, + used): the submission's beginning and
+  // end, then pairs around the work of the scopes.
+  static constexpr uint32_t kTimestampSubmissionSlots = 64;
+  static constexpr uint32_t kTimestampsPerSubmission = 4096;
+  struct TimestampSlot {
+    uint64_t submission = 0;
+    uint32_t used = 0;
+    // Category and index of the first query of each scope's pair.
+    std::vector<std::pair<uint32_t, uint32_t>> scopes;
+  };
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamp_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> timestamp_readback_;
+  const uint64_t* timestamp_readback_mapping_ = nullptr;
+  uint64_t timestamp_frequency_ = 0;
+  TimestampSlot timestamp_slots_[kTimestampSubmissionSlots];
+  void InitializeTimestampResources();
+  void ShutdownTimestampResources();
+  void CollectTimestamps(uint64_t completed_before, uint64_t completed_now);
+
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
@@ -772,6 +837,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // (readback_memexport_deferred), and their total size.
   std::vector<draw_util::MemExportRange> memexport_readback_deferred_ranges_;
   uint32_t memexport_readback_deferred_size_ = 0;
+  // Persistently mapped readback buffers for asynchronous memexport readback
+  // (readback_memexport_async), reused once their data is copied to the guest.
+  struct AsyncReadbackBuffer {
+    ID3D12Resource* buffer = nullptr;
+    void* mapping = nullptr;
+    uint32_t size = 0;
+    bool in_use = false;
+  };
+  std::vector<AsyncReadbackBuffer> async_readback_buffers_;
 };
 
 }  // namespace rex::graphics::d3d12

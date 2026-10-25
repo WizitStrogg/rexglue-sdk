@@ -26,6 +26,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -39,6 +40,31 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_BOOL(async_guest_writes_counter_immediate, false, "GPU",
+                    "Experimental: with asynchronous guest-visible writes, write the GPU "
+                    "counter event (used by games for frame pacing) immediately instead of "
+                    "after the GPU work before it has completed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(async_guest_writes_wait_lookup, false, "GPU",
+                    "Experimental: let WAIT_REG_MEM see asynchronous guest-visible writes that "
+                    "are still queued instead of draining the queue. Suspected of freezing Fable "
+                    "II while loading: the queued write is then done later, possibly after a "
+                    "newer CPU write to the same memory (the frame counter)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(async_guest_writes_cond_writes, false, "GPU",
+                    "Experimental: queue REG_TO_MEM and COND_WRITE memory writes with the "
+                    "asynchronous guest-visible writes instead of waiting for the GPU first")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
+                     "When the command processor has had no commands for this many "
+                     "milliseconds, write the current GPU counter to where the last counter "
+                     "event wrote it, if it has advanced, so a guest polling that counter for a "
+                     "fence can't wait forever for commands it hasn't submitted (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
                      "Host guest-frame swap limit in FPS (0 = unlimited). "
@@ -334,12 +360,28 @@ void CommandProcessor::WorkerThreadMain() {
       // event is too high.
       PrepareForWait();
       uint32_t loop_count = 0;
+      const auto idle_start = std::chrono::steady_clock::now();
+      auto idle_next_log = idle_start + std::chrono::seconds(3);
       do {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+          // Writes queued after the wait preparation (none expected) and the
+          // periodic diagnostics must not depend on new commands arriving.
+          if (!async_guest_writes_.empty()) {
+            FlushAsyncGuestVisibleWrites(false);
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const int32_t refresh_ms = REXCVAR_GET(gpu_idle_counter_refresh_ms);
+          if (refresh_ms > 0 && now - idle_start >= std::chrono::milliseconds(refresh_ms)) {
+            RefreshCounterWhileIdle();
+          }
+          if (now >= idle_next_log) {
+            LogIdleStall(now - idle_start);
+            idle_next_log = now + std::chrono::seconds(5);
+          }
         }
 
         rex::thread::MaybeYield();
@@ -724,7 +766,273 @@ void CommandProcessor::MakeCoherent() {
   regs_volatile[XE_GPU_REG_COHER_STATUS_HOST] = 0;
 }
 
-void CommandProcessor::PrepareForWait() {}
+void CommandProcessor::PrepareForWait() { FlushAsyncGuestVisibleWrites(true); }
+
+void CommandProcessor::QueueAsyncGuestVisibleWrite(
+    uint64_t token, std::function<void()> write,
+    std::vector<std::pair<uint32_t, uint32_t>> stores) {
+  if (!async_guest_writes_.empty()) {
+    // Keep the writes in order.
+    token = std::max(token, async_guest_writes_.back().token);
+  }
+  std::vector<AsyncGuestVisibleWrite::Store> queued_stores;
+  queued_stores.reserve(stores.size());
+  for (const auto& store : stores) {
+    uint32_t expected = LoadMemoryForGpu(store.first);
+    for (const AsyncGuestVisibleWrite::Store& earlier : queued_stores) {
+      if (earlier.address == store.first) {
+        expected = earlier.value;
+      }
+    }
+    queued_stores.push_back({store.first, store.second, expected});
+  }
+  async_guest_writes_.push_back({token, std::move(write), std::move(queued_stores)});
+}
+
+void CommandProcessor::FlushAsyncGuestVisibleWrites(bool wait) {
+  while (!async_guest_writes_.empty()) {
+    AsyncGuestVisibleWrite& front = async_guest_writes_.front();
+    if (!IsAsyncGuestVisibleWriteReady(front.token, wait)) {
+      break;
+    }
+    std::function<void()> write = std::move(front.write);
+    std::vector<AsyncGuestVisibleWrite::Store> stores = std::move(front.stores);
+    async_guest_writes_.pop_front();
+    for (const AsyncGuestVisibleWrite::Store& store : stores) {
+      uint32_t* host_address =
+          reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(store.address));
+      if (*host_address != store.expected) {
+        // Written by the CPU after the GPU write in the command stream, which
+        // is what the CPU would have seen if the write had been done then.
+        ++async_diag_.stores_kept_cpu_value;
+        continue;
+      }
+      *host_address = store.value;
+    }
+    if (write) {
+      write();
+    }
+  }
+}
+
+uint32_t CommandProcessor::LoadMemoryForGpu(uint32_t physical_address_dword,
+                                            bool* from_queue) const {
+  for (auto it = async_guest_writes_.rbegin(); it != async_guest_writes_.rend(); ++it) {
+    for (auto store = it->stores.rbegin(); store != it->stores.rend(); ++store) {
+      if (store->address == physical_address_dword) {
+        if (from_queue) {
+          *from_queue = true;
+        }
+        return store->value;
+      }
+    }
+  }
+  if (from_queue) {
+    *from_queue = false;
+  }
+  return *reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(physical_address_dword));
+}
+
+void CommandProcessor::LogAsyncGuestWriteDiag() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - async_diag_last_log_ < std::chrono::seconds(5)) {
+    return;
+  }
+  const AsyncGuestWriteDiag& d = async_diag_;
+  REXGPU_INFO(
+      "Guest-visible writes in 5 s: {} swaps; queued {} counter / {} value events, {} mem "
+      "writes, {} interrupts; {} counter events immediate; {} immediate; {} drains; waits: {} "
+      "satisfied by queued writes, {} drains; {} queued register/conditional writes; {} queued "
+      "stores skipped for newer CPU writes; {}",
+      d.swaps, d.counter_events, d.value_events, d.mem_writes, d.interrupts, d.counter_immediate,
+      d.immediate, d.drains, d.wait_queue_hits, d.wait_drains, d.cond_writes,
+      d.stores_kept_cpu_value, diag::TakeSummary());
+  async_diag_ = {};
+  async_diag_last_log_ = now;
+}
+
+void CommandProcessor::RefreshCounterWhileIdle() {
+  if (!last_shd_counter_address_) {
+    return;
+  }
+  uint8_t* host_address = memory_->TranslatePhysical(last_shd_counter_address_);
+  uint32_t current =
+      GpuSwap(*reinterpret_cast<const uint32_t*>(host_address), last_shd_counter_endian_);
+  // Only move the counter forward (the guest also writes it).
+  if (int32_t(counter_ - current) <= 0) {
+    return;
+  }
+  *reinterpret_cast<uint32_t*>(host_address) = GpuSwap(counter_, last_shd_counter_endian_);
+  last_shd_counter_value_ = counter_;
+  if (!(idle_counter_refreshes_++ & 63)) {
+    REXGPU_INFO("Command processor idle: refreshed the GPU counter at {:08X} from {} to {} ({} "
+                "times so far)",
+                last_shd_counter_address_, current, counter_, idle_counter_refreshes_);
+  }
+}
+
+void CommandProcessor::LogIdleStall(std::chrono::steady_clock::duration idle_time) {
+  auto load = [this](uint32_t address) -> uint32_t {
+    if (!address) {
+      return 0;
+    }
+    return rex::byte_swap(*reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(address)));
+  };
+  REXGPU_INFO(
+      "Command processor idle for {} ms: counter {}; last counter write {:08X} = {} (now {}); "
+      "last value write {:08X} = {:08X} (now {:08X}); last memory wait {:08X} for {:08X} "
+      "(now {:08X}); {} queued writes",
+      std::chrono::duration_cast<std::chrono::milliseconds>(idle_time).count(), counter_,
+      last_shd_counter_address_, last_shd_counter_value_, load(last_shd_counter_address_),
+      last_shd_value_address_, last_shd_value_value_, load(last_shd_value_address_),
+      last_wait_reg_mem_address_, last_wait_reg_mem_reference_, load(last_wait_reg_mem_address_),
+      async_guest_writes_.size());
+}
+
+bool CommandProcessor::CompareWaitValue(uint32_t wait_info, uint32_t value, uint32_t mask,
+                                        uint32_t ref) {
+  switch (wait_info & 0x7) {
+    case 0x1:  // Less than reference.
+      return (value & mask) < ref;
+    case 0x2:  // Less than or equal to reference.
+      return (value & mask) <= ref;
+    case 0x3:  // Equal to reference.
+      return (value & mask) == ref;
+    case 0x4:  // Not equal to reference.
+      return (value & mask) != ref;
+    case 0x5:  // Greater than or equal to reference.
+      return (value & mask) >= ref;
+    case 0x6:  // Greater than reference.
+      return (value & mask) > ref;
+    case 0x7:  // Always
+      return true;
+    default:  // Never.
+      return false;
+  }
+}
+
+bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, uint32_t opcode,
+                                                  uint32_t count, bool* result) {
+  if (opcode == PM4_EVENT_WRITE_SHD && REXCVAR_GET(async_guest_writes_counter_immediate)) {
+    // Experiment: the counter variant of the event (used by games to pace
+    // frames) is written right away, ahead of the queued writes, so frame
+    // pacing doesn't wait for the GPU. Peek at the initiator.
+    uint32_t initiator =
+        rex::byte_swap(*reinterpret_cast<const uint32_t*>(reader->buffer() + reader->read_offset()));
+    if ((initiator >> 31) & 0x1) {
+      reader->AdvanceRead(sizeof(uint32_t));
+      uint32_t address = reader->ReadAndSwap<uint32_t>();
+      reader->ReadAndSwap<uint32_t>();
+      WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+      auto endianness = static_cast<xenos::Endian>(address & 0x3);
+      uint32_t addr = address & ~uint32_t(0x3);
+      // Older queued stores to the counter must not overwrite this value.
+      for (AsyncGuestVisibleWrite& queued : async_guest_writes_) {
+        std::erase_if(queued.stores, [addr](const auto& store) { return store.address == addr; });
+      }
+      memory::store(memory_->TranslatePhysical(addr), GpuSwap(counter_, endianness));
+      ++async_diag_.counter_immediate;
+      *result = true;
+      return true;
+    }
+  }
+  uint64_t token = PrepareAsyncGuestVisibleWrite();
+  if (!token && async_guest_writes_.empty()) {
+    return false;
+  }
+  *result = true;
+  switch (opcode) {
+    case PM4_INTERRUPT: {
+      uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+      QueueAsyncGuestVisibleWrite(token, [this, cpu_mask]() {
+        for (int n = 0; n < 6; n++) {
+          if ((cpu_mask & (1 << n)) && graphics_system_) {
+            graphics_system_->DispatchInterruptCallback(1, n);
+          }
+        }
+      });
+      ++async_diag_.interrupts;
+    } break;
+    case PM4_MEM_WRITE: {
+      uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
+      std::vector<std::pair<uint32_t, uint32_t>> stores;
+      stores.reserve(count ? count - 1 : 0);
+      for (uint32_t i = 1; i < count; ++i) {
+        uint32_t data = reader->ReadAndSwap<uint32_t>();
+        uint32_t addr = write_addr + (i - 1) * 4;
+        auto endianness = static_cast<xenos::Endian>(addr & 0x3);
+        uint32_t stored;
+        memory::store(&stored, GpuSwap(data, endianness));
+        stores.emplace_back(addr & ~uint32_t(0x3), stored);
+      }
+      QueueAsyncGuestVisibleWrite(token, nullptr, std::move(stores));
+      ++async_diag_.mem_writes;
+    } break;
+    case PM4_EVENT_WRITE_SHD: {
+      uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+      uint32_t address = reader->ReadAndSwap<uint32_t>();
+      uint32_t value = reader->ReadAndSwap<uint32_t>();
+      WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+      bool is_counter = (initiator >> 31) & 0x1;
+      uint32_t data_value = is_counter ? counter_ : value;
+      if (is_counter) {
+        last_shd_counter_address_ = address & ~uint32_t(0x3);
+        last_shd_counter_value_ = data_value;
+        last_shd_counter_endian_ = static_cast<xenos::Endian>(address & 0x3);
+      } else {
+        last_shd_value_address_ = address & ~uint32_t(0x3);
+        last_shd_value_value_ = data_value;
+      }
+      auto endianness = static_cast<xenos::Endian>(address & 0x3);
+      uint32_t stored;
+      memory::store(&stored, GpuSwap(data_value, endianness));
+      uint32_t addr = address & ~uint32_t(0x3);
+      QueueAsyncGuestVisibleWrite(token, nullptr, {{addr, stored}});
+      ++(is_counter ? async_diag_.counter_events : async_diag_.value_events);
+    } break;
+    case PM4_REG_TO_MEM: {
+      uint32_t reg_addr = reader->ReadAndSwap<uint32_t>();
+      uint32_t mem_addr = reader->ReadAndSwap<uint32_t>();
+      uint32_t stored;
+      memory::store(&stored, GpuSwap(ReadRegisterValue(reg_addr),
+                                     static_cast<xenos::Endian>(mem_addr & 0x3)));
+      QueueAsyncGuestVisibleWrite(token, nullptr, {{mem_addr & ~uint32_t(0x3), stored}});
+      ++async_diag_.cond_writes;
+    } break;
+    case PM4_COND_WRITE: {
+      uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
+      uint32_t poll_reg_addr = reader->ReadAndSwap<uint32_t>();
+      uint32_t ref = reader->ReadAndSwap<uint32_t>();
+      uint32_t mask = reader->ReadAndSwap<uint32_t>();
+      uint32_t write_reg_addr = reader->ReadAndSwap<uint32_t>();
+      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+      uint32_t value;
+      if (wait_info & 0x10) {
+        // The memory as the GPU sees it, with the queued writes done.
+        value = GpuSwap(LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3)),
+                        static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+      } else {
+        value = ReadRegisterValue(poll_reg_addr);
+      }
+      if (CompareWaitValue(wait_info, value, mask, ref)) {
+        if (wait_info & 0x100) {
+          uint32_t stored;
+          memory::store(&stored,
+                        GpuSwap(write_data, static_cast<xenos::Endian>(write_reg_addr & 0x3)));
+          QueueAsyncGuestVisibleWrite(token, nullptr, {{write_reg_addr & ~uint32_t(0x3), stored}});
+        } else {
+          WriteRegister(write_reg_addr, write_data);
+        }
+      }
+      ++async_diag_.cond_writes;
+    } break;
+    default:
+      assert_unhandled_case(opcode);
+      *result = false;
+      break;
+  }
+  return true;
+}
 
 void CommandProcessor::ReturnFromWait() {}
 
@@ -868,16 +1176,44 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  if (!async_guest_writes_.empty() && !(++async_guest_writes_poll_counter_ & 15)) {
+    FlushAsyncGuestVisibleWrites(false);
+  }
   switch (opcode) {
     case PM4_INTERRUPT:
-    case PM4_XE_SWAP:
-    case PM4_REG_TO_MEM:
     case PM4_MEM_WRITE:
+    case PM4_EVENT_WRITE_SHD: {
+      bool async_result;
+      if (TryExecutePacketType3Async(reader, opcode, count, &async_result)) {
+        return async_result;
+      }
+      ++async_diag_.immediate;
+      OnBeforeGuestVisibleWrite();
+    } break;
+    case PM4_XE_SWAP:
+      // Presenting doesn't make GPU results visible to the guest CPU.
+      ++async_diag_.swaps;
+      LogAsyncGuestWriteDiag();
+      FlushAsyncGuestVisibleWrites(false);
+      break;
+    case PM4_REG_TO_MEM:
     case PM4_COND_WRITE:
-    case PM4_EVENT_WRITE_SHD:
+      if (REXCVAR_GET(async_guest_writes_cond_writes)) {
+        bool async_result;
+        if (TryExecutePacketType3Async(reader, opcode, count, &async_result)) {
+          return async_result;
+        }
+      }
+      if (!async_guest_writes_.empty()) {
+        ++async_diag_.drains;
+      }
+      FlushAsyncGuestVisibleWrites(true);
+      OnBeforeGuestVisibleWrite();
+      break;
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
-      OnBeforeGuestVisibleWrite();
+      // Screen extents are faked, and occlusion query results don't depend on
+      // memexport or on fence ordering, so neither needs to wait for the GPU.
       break;
     default:
       break;
@@ -1116,13 +1452,26 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  if (is_memory) {
+    last_wait_reg_mem_address_ = poll_reg_addr & ~uint32_t(0x3);
+    last_wait_reg_mem_reference_ = ref;
+  }
 
   bool matched = false;
+  bool value_from_queue = false;
+  bool counted_queue_hit = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      // With async_guest_writes_wait_lookup, writes queued asynchronously
+      // earlier in the command stream are treated as already done, as they
+      // are from the GPU's point of view.
+      if (REXCVAR_GET(async_guest_writes_wait_lookup)) {
+        value = LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3), &value_from_queue);
+      } else {
+        value = *reinterpret_cast<uint32_t*>(
+            memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      }
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -1157,7 +1506,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+    if (matched && value_from_queue && !counted_queue_hit) {
+      ++async_diag_.wait_queue_hits;
+      counted_queue_hit = true;
+    }
     if (!matched) {
+      if (!async_guest_writes_.empty()) {
+        ++async_diag_.wait_drains;
+      }
       // Wait.
       if (wait >= 0x100) {
         // Diagnostic: per-second summary of WAIT_REG_MEM wait-hint sleeps
@@ -1202,6 +1558,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           return false;
         }
       } else {
+        // The value may be written by a queued asynchronous write.
+        FlushAsyncGuestVisibleWrites(true);
         rex::thread::MaybeYield();
       }
     }
@@ -1362,9 +1720,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
     data_value = counter_;
+    last_shd_counter_address_ = address & ~uint32_t(0x3);
+    last_shd_counter_value_ = data_value;
+    last_shd_counter_endian_ = static_cast<xenos::Endian>(address & 0x3);
   } else {
     // Write value.
     data_value = value;
+    last_shd_value_address_ = address & ~uint32_t(0x3);
+    last_shd_value_value_ = data_value;
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
