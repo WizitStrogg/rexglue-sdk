@@ -2978,6 +2978,42 @@ bool D3D12CommandProcessor::IsPageInPendingLazyReadback(uint32_t page) const {
   return false;
 }
 
+void D3D12CommandProcessor::GetPendingLazyReadbackRanges(
+    uint32_t start, uint32_t length,
+    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const {
+  if (!length || !lazy_readback_count_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  size_t first_new = ranges_out.size();
+  uint32_t end = start + length;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (const LazyReadback& readback : lazy_readbacks_) {
+      for (const draw_util::MemExportRange& range : readback.ranges) {
+        uint32_t range_start = std::max(start, range.base_address_dwords << 2);
+        uint32_t range_end = std::min(end, (range.base_address_dwords << 2) + range.size_bytes);
+        if (range_start < range_end) {
+          ranges_out.emplace_back(range_start, range_end);
+        }
+      }
+    }
+  }
+  if (ranges_out.size() - first_new < 2) {
+    return;
+  }
+  std::sort(ranges_out.begin() + first_new, ranges_out.end());
+  size_t merged_last = first_new;
+  for (size_t i = first_new + 1; i < ranges_out.size(); ++i) {
+    if (ranges_out[i].first <= ranges_out[merged_last].second) {
+      ranges_out[merged_last].second =
+          std::max(ranges_out[merged_last].second, ranges_out[i].second);
+    } else {
+      ranges_out[++merged_last] = ranges_out[i];
+    }
+  }
+  ranges_out.resize(merged_last + 1);
+}
+
 uint64_t D3D12CommandProcessor::GetLazyReadbackSubmission(uint32_t physical_address,
                                                           uint32_t length) const {
   uint64_t submission = 0;

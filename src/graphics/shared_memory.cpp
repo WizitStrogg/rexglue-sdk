@@ -23,11 +23,11 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, true, "GPU",
+REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, false, "GPU",
                     "When the CPU writes to memory holding GPU-written data that may not have "
-                    "been read back yet (always possible with readback_memexport_lazy or with "
-                    "memexport readback off), upload only the dwords the CPU changed, keeping the "
-                    "GPU's results in the rest")
+                    "been read back yet (always possible with memexport readback off), upload "
+                    "only the dwords the CPU changed, keeping the GPU's results in the rest. A "
+                    "CPU write of the value the stale guest copy already holds is lost")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {

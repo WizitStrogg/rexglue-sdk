@@ -85,6 +85,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+  // Appends the parts of [start, start + length) that pending lazy memexport
+  // readbacks are still going to overwrite in guest memory, as sorted and
+  // merged [start, end) pairs.
+  // Guest memory there is older than the GPU's data, so it must not be
+  // uploaded over it. Locks the global critical region.
+  void GetPendingLazyReadbackRanges(uint32_t start, uint32_t length,
+                                    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const;
+
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
   // done after the latest ExecuteCommandLists + Signal.
