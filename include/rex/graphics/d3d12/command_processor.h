@@ -85,13 +85,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
-  // Appends the parts of [start, start + length) that pending lazy memexport
-  // readbacks are still going to overwrite in guest memory, as sorted and
-  // merged [start, end) pairs.
+  // Appends the parts of [start, start + length) holding memexport results that
+  // aren't in guest memory yet (being read back lazily, or written since the
+  // last readback, per readback_memexport_keep_unread), as sorted and merged
+  // [start, end) pairs.
   // Guest memory there is older than the GPU's data, so it must not be
-  // uploaded over it. Locks the global critical region.
-  void GetPendingLazyReadbackRanges(uint32_t start, uint32_t length,
-                                    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const;
+  // uploaded over it. Command processor thread, locks the global critical
+  // region.
+  void GetUnreadMemexportRanges(uint32_t start, uint32_t length,
+                                std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const;
 
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
@@ -402,8 +404,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // write, waiting for the GPU once for all of them.
   void FlushDeferredMemexportReadback();
   // readback_memexport_lazy: submits the copy of the deferred memexport
-  // destinations and read-watches their pages instead of waiting.
-  void IssueLazyMemexportReadback();
+  // destinations and read-watches their pages instead of waiting. Returns the
+  // submission of the copy, or 0 if none was needed or it was done
+  // synchronously.
+  uint64_t IssueLazyMemexportReadback();
   // Copies the lazy readbacks completed by the submission to guest memory in
   // order, and removes the read watches from the pages no pending readback
   // covers. The global critical region must be locked.

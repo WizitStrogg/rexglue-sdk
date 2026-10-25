@@ -26,6 +26,10 @@ inline std::atomic<uint64_t> merged_dwords{0};
 // overwrite stale guest memory, and the bytes kept.
 inline std::atomic<uint64_t> uploads_keeping_readback_data{0};
 inline std::atomic<uint64_t> upload_bytes_kept_for_readback{0};
+// Uploads over memexport results written since the last readback (kept or
+// not, per readback_memexport_keep_unread), and the bytes.
+inline std::atomic<uint64_t> uploads_over_unread_memexport{0};
+inline std::atomic<uint64_t> upload_bytes_over_unread_memexport{0};
 // Draws with memory export, and the bytes they export (known ranges only).
 inline std::atomic<uint64_t> memexport_draws{0};
 inline std::atomic<uint64_t> memexport_bytes{0};
@@ -188,7 +192,8 @@ inline std::string TakeTransferSummary() {
 inline std::string TakeSummary() {
   return fmt::format(
       "memexport {} draws / {} KB, readback {} KB, CPU writes to GPU-written pages {}, merged "
-      "uploads {} pages / {} dwords, uploads keeping pending readback data {} ({} KB), {} "
+      "uploads {} pages / {} dwords, uploads keeping pending readback data {} ({} KB), uploads over unread memexport results {} "
+      "({} KB), {} "
       "submissions, GPU busy {} ms, command processor GPU "
       "waits {} ms (of the GPU time: render target transfers {} ms, texture loads {} ms, "
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
@@ -201,6 +206,7 @@ inline std::string TakeSummary() {
       readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0),
       uploads_keeping_readback_data.exchange(0), upload_bytes_kept_for_readback.exchange(0) >> 10,
+      uploads_over_unread_memexport.exchange(0), upload_bytes_over_unread_memexport.exchange(0) >> 10,
       submissions.exchange(0),
       gpu_busy_us.exchange(0) / 1000, cp_gpu_wait_us.exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kRenderTargetTransfers)].exchange(0) / 1000,

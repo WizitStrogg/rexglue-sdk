@@ -341,12 +341,11 @@ bool D3D12SharedMemory::UploadRanges(
   };
 
   auto upload_pages = [&](uint32_t upload_range_start, uint32_t upload_range_length) -> bool {
-    // Where a lazy memexport readback is pending, guest memory is older than
-    // the GPU's data until the readback is applied, so keep the GPU's data
-    // there, as an eager readback would have overwritten guest memory with it
-    // already.
+    // Where memexport results haven't been read back yet, guest memory is
+    // older than the GPU's data, so keep the GPU's data there, as an eager
+    // readback would have overwritten guest memory with it already.
     upload_kept_ranges_.clear();
-    command_processor_.GetPendingLazyReadbackRanges(upload_range_start << page_size_log2(),
+    command_processor_.GetUnreadMemexportRanges(upload_range_start << page_size_log2(),
                                                     upload_range_length << page_size_log2(),
                                                     upload_kept_ranges_);
     if (!upload_kept_ranges_.empty()) {
@@ -403,10 +402,11 @@ bool D3D12SharedMemory::UploadRanges(
     MakeRangeValid(page_address, uint32_t(1) << page_size_log2(), true);
     const uint32_t* current =
         reinterpret_cast<const uint32_t*>(memory().TranslatePhysical(page_address));
-    // Guest memory is stale where a lazy readback is pending (see upload_pages).
+    // Guest memory is stale where memexport results are unread (see
+    // upload_pages).
     upload_kept_ranges_.clear();
-    command_processor_.GetPendingLazyReadbackRanges(page_address, uint32_t(1) << page_size_log2(),
-                                                    upload_kept_ranges_);
+    command_processor_.GetUnreadMemexportRanges(page_address, uint32_t(1) << page_size_log2(),
+                                                upload_kept_ranges_);
     if (!upload_kept_ranges_.empty()) {
       diag::uploads_keeping_readback_data.fetch_add(1, std::memory_order_relaxed);
     }
