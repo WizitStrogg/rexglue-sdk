@@ -1978,6 +1978,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
+  if (render_target_cache_) {
+    render_target_cache_->OnSwapForFrameLog();
+  }
+
   if (!graphics_system_)
     return;
   ui::Presenter* presenter = graphics_system_->presenter();

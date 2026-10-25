@@ -57,6 +57,13 @@ REXCVAR_DEFINE_BOOL(skip_redundant_render_target_transfers, true, "GPU",
                     "1x and 4x MSAA with only depth testing in one of them)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(render_target_frame_log, 0, "GPU",
+                     "Diagnostic: when changed to a value N above 0, log the render target "
+                     "bindings, ownership transfers and resolves of the next N frames (up to 8) "
+                     "as RTLOG lines")
+    .range(0, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -423,11 +430,37 @@ void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
 
+void RenderTargetCache::OnSwapForFrameLog() {
+  if (frame_log_frames_remaining_) {
+    REXGPU_INFO("RTLOG frame end: {} draws, {} since the last line", frame_log_draw_,
+                frame_log_draws_since_line_);
+    --frame_log_frames_remaining_;
+  }
+  int32_t request = REXCVAR_GET(render_target_frame_log);
+  if (request != frame_log_last_request_) {
+    frame_log_last_request_ = request;
+    if (request > 0 && !frame_log_frames_remaining_) {
+      frame_log_frames_remaining_ = uint32_t(std::min(request, int32_t(8)));
+    }
+  }
+  if (frame_log_frames_remaining_) {
+    frame_log_draw_ = 0;
+    frame_log_draws_since_line_ = 0;
+    frame_log_last_keys_ = {};
+    REXGPU_INFO("RTLOG frame begin ({} to log including this one)", frame_log_frames_remaining_);
+  }
+}
+
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+
+  if (frame_log_frames_remaining_) {
+    ++frame_log_draw_;
+    ++frame_log_draws_since_line_;
+  }
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -831,6 +864,42 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     if (writes) {
       MarkOwnershipRangeWritten(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                                 writes_stencil ? (rt_bit_index ? 1 : 2) : 0);
+    }
+  }
+
+  if (frame_log_frames_remaining_) {
+    std::array<RenderTargetKey, 1 + xenos::kMaxColorRenderTargets> keys{};
+    bool any_transfers = false;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      keys[rt_bit_index] = rt_keys[rt_bit_index];
+      any_transfers |= !last_update_transfers_[rt_bit_index].empty();
+    }
+    if (any_transfers || keys != frame_log_last_keys_) {
+      std::string line = fmt::format(
+          "RTLOG d{} after {} draws: est height {}, z {}{} stencil {}{}, color mask {:04X}",
+          frame_log_draw_, frame_log_draws_since_line_ - 1, height_used,
+          normalized_depth_control.z_enable ? "test" : "off",
+          normalized_depth_control.z_enable && normalized_depth_control.z_write_enable ? "+write"
+                                                                                        : "",
+          normalized_depth_control.stencil_enable ? "on" : "off",
+          draw_writes_stencil ? "+write" : "", normalized_color_mask);
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        uint32_t rt_bit_index = edram_bases_sorted[i].second;
+        line += rt_bit_index ? fmt::format(" | c{} ", rt_bit_index - 1) : std::string(" | depth ");
+        line += fmt::format("{} [{}..{})t", rt_keys[rt_bit_index].GetDebugName(),
+                            uint32_t(rt_keys[rt_bit_index].base_tiles),
+                            rt_keys[rt_bit_index].base_tiles + rt_lengths_tiles[i]);
+        for (const Transfer& transfer : last_update_transfers_[rt_bit_index]) {
+          line += fmt::format(" <- [{}..{})t from {}{}{}", transfer.start_tiles,
+                              transfer.end_tiles, transfer.source->key().GetDebugName(),
+                              transfer.host_depth_source ? " +host depth" : "",
+                              transfer.stencil_unchanged ? " depth only" : "");
+        }
+      }
+      REXGPU_INFO("{}", line);
+      frame_log_last_keys_ = keys;
+      frame_log_draws_since_line_ = 0;
     }
   }
 
@@ -1279,6 +1348,30 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
         color_render_target_key, color_clear_start_tiles_base_relative, color_clear_length_tiles,
         resolve_info.color_edram_info.format_is_64bpp ? 0xFF : (resolve_info.rb_color_clear & 0xFF),
         clear_covers_whole_tiles && !resolve_info.color_edram_info.format_is_64bpp);
+  }
+  if (frame_log_frames_remaining_) {
+    std::string line = fmt::format(
+        "RTLOG resolve clear after d{}: rect {},{} {}x{} px, depth {:08X} color {:08X}",
+        frame_log_draw_, clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+        clear_rectangle.width_pixels, clear_rectangle.height_pixels, resolve_info.rb_depth_clear,
+        resolve_info.rb_color_clear);
+    auto append_clear = [&](const char* name, RenderTargetKey key, uint32_t start, uint32_t length,
+                            const std::vector<Transfer>& transfers) {
+      if (!length) {
+        return;
+      }
+      line += fmt::format(" | {} {} [{}..{})t", name, key.GetDebugName(), key.base_tiles + start,
+                          key.base_tiles + start + length);
+      for (const Transfer& transfer : transfers) {
+        line += fmt::format(" <- [{}..{})t from {}", transfer.start_tiles, transfer.end_tiles,
+                            transfer.source->key().GetDebugName());
+      }
+    };
+    append_clear("depth", depth_render_target_key, depth_clear_start_tiles_base_relative,
+                 depth_clear_length_tiles, depth_transfers_out);
+    append_clear("color", color_render_target_key, color_clear_start_tiles_base_relative,
+                 color_clear_length_tiles, color_transfers_out);
+    REXGPU_INFO("{}", line);
   }
   return true;
 }

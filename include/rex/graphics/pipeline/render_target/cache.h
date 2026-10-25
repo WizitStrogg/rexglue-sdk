@@ -172,6 +172,10 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // At a guest swap: ends and starts frames of the render_target_frame_log
+  // diagnostic.
+  void OnSwapForFrameLog();
+
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -506,6 +510,11 @@ class RenderTargetCache {
   // Set once a draw depending on the current stencil values is seen.
   bool stencil_values_consumed_ = false;
 
+  // render_target_frame_log: frames still to log, and the current frame's draw
+  // count (Update calls).
+  uint32_t frame_log_frames_remaining_ = 0;
+  uint32_t frame_log_draw_ = 0;
+
   void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
@@ -569,6 +578,10 @@ class RenderTargetCache {
 
  private:
   const RegisterFile& register_file_;
+
+  int32_t frame_log_last_request_ = 0;
+  uint32_t frame_log_draws_since_line_ = 0;
+  std::array<RenderTargetKey, 1 + xenos::kMaxColorRenderTargets> frame_log_last_keys_{};
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 

@@ -1218,6 +1218,26 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     return true;
   }
 
+  if (frame_log_frames_remaining_) {
+    const draw_util::ResolveEdramInfo& source_edram_info =
+        resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info
+                                      : resolve_info.color_edram_info;
+    REXGPU_INFO(
+        "RTLOG resolve after d{}: {} {} @ {}t <{}t> {}xMSAA format {}, offset {},{} size {}x{} px, "
+        "copy to {:08X} ({} bytes), clear depth {} color {}",
+        frame_log_draw_, resolve_info.IsCopyingDepth() ? "depth" : "color",
+        resolve_info.IsCopyingDepth() ? 0 : uint32_t(resolve_info.rb_copy_control.copy_src_select),
+        uint32_t(source_edram_info.base_tiles), uint32_t(source_edram_info.pitch_tiles),
+        uint32_t(1) << uint32_t(source_edram_info.msaa_samples),
+        uint32_t(source_edram_info.format),
+        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3,
+        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3,
+        uint32_t(resolve_info.coordinate_info.width_div_8) << 3, resolve_info.height_div_8 << 3,
+        resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
+        resolve_info.IsClearingDepth() ? "yes" : "no",
+        resolve_info.IsClearingColor() ? "yes" : "no");
+  }
+
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   // Copying.
