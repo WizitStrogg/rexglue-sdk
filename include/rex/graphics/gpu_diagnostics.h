@@ -97,6 +97,22 @@ inline std::atomic<uint64_t> lazy_page_accesses{0};
 inline std::atomic<uint64_t> lazy_page_access_waits{0};
 inline std::atomic<uint64_t> lazy_page_access_wait_us{0};
 inline std::atomic<uint64_t> lazy_gpu_reads{0};
+// readback_memexport_lazy: guest memory the command processor reads to
+// execute it, overlapping memexport results still being copied back, or not
+// copied back yet.
+enum class CpMemoryRead : uint32_t {
+  kConstants,
+  kShader,
+  kIndirectBuffer,
+  kCount,
+};
+inline std::array<std::atomic<uint64_t>, size_t(CpMemoryRead::kCount)>
+    cp_reads_of_pending_memexport{};
+inline std::array<std::atomic<uint64_t>, size_t(CpMemoryRead::kCount)>
+    cp_reads_of_unissued_memexport{};
+// readback_memexport_lazy_apply_thread: copies put in guest memory as soon as
+// the GPU completed them.
+inline std::atomic<uint64_t> lazy_readbacks_applied_by_thread{0};
 // Command processor time spent waiting for the GPU, in microseconds.
 inline std::atomic<uint64_t> cp_gpu_wait_us{0};
 // Time the submission thread spent replaying and submitting command lists, and
@@ -233,6 +249,18 @@ inline std::string TakeUploadReasonSummary() {
   return summary;
 }
 
+inline std::string TakeLazyCpReadSummary() {
+  std::string summary;
+  for (size_t i = 0; i < size_t(CpMemoryRead::kCount); ++i) {
+    summary += fmt::format("{}{}", i ? "/" : "", cp_reads_of_pending_memexport[i].exchange(0));
+  }
+  summary += ", not copied back yet ";
+  for (size_t i = 0; i < size_t(CpMemoryRead::kCount); ++i) {
+    summary += fmt::format("{}{}", i ? "/" : "", cp_reads_of_unissued_memexport[i].exchange(0));
+  }
+  return summary;
+}
+
 inline std::string TakeSummary() {
   return fmt::format(
       "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB (by reason, "
@@ -245,7 +273,8 @@ inline std::string TakeSummary() {
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
       "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
       "(command processor waited {} ms for it), lazy readbacks {}, guest accesses to pages "
-      "being read back {} ({} waited, {} ms), command processor reads of them {}, frame "
+      "being read back {} ({} waited, {} ms), command processor reads of them {} "
+      "(constants/shaders/indirect buffers {}), copies applied by the apply thread {}, frame "
       "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms, "
       "frames over 20/33/50 ms {}/{}/{}, longest {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
@@ -270,6 +299,7 @@ inline std::string TakeSummary() {
       submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000,
       lazy_readbacks.exchange(0), lazy_page_accesses.exchange(0), lazy_page_access_waits.exchange(0),
       lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0),
+      TakeLazyCpReadSummary(), lazy_readbacks_applied_by_thread.exchange(0),
       frame_limiter_wait_us.exchange(0) / 1000, frame_limiter_waits.exchange(0),
       frame_limiter_late_frames.exchange(0), frame_limiter_resets.exchange(0),
       cp_idle_us.exchange(0) / 1000, frames_over_20ms.exchange(0), frames_over_33ms.exchange(0),

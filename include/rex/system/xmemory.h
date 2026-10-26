@@ -256,6 +256,11 @@ class BaseHeap {
   // Only PhysicalHeap tracks this; every other heap has no watch state.
   virtual bool IsHostPageWriteWatched(uint32_t host_page_number) const { return false; }
 
+  // Whether a host page is read-watched (Memory::EnablePhysicalMemoryReadWatches)
+  // and must stay inaccessible until its data is provided. Only PhysicalHeap
+  // tracks this. Declared last so the existing vtable slots stay in place.
+  virtual bool IsHostPageReadWatched(uint32_t host_page_number) const { return false; }
+
   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
 
@@ -331,6 +336,12 @@ class PhysicalHeap : public BaseHeap {
 
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+  bool IsHostPageReadWatched(uint32_t host_page_number) const override;
+
+  // The host access of a page of this view when it's not read-watched: the
+  // guest protection if committed here, otherwise the access left to
+  // physical aliases (see protect_on_release).
+  rex::memory::PageAccess GetUnwatchedPageAccess(uint32_t guest_page_number) const;
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
   // pass takes the global critical region. Acquire whenever this heap or its
@@ -521,6 +532,26 @@ class Memory {
   // Global critical region must be locked.
   void ProvidePhysicalMemoryData(uint32_t physical_address, uint32_t length);
 
+  // Read watch diagnostics since the last call.
+  struct ReadWatchStats {
+    // Pages watched in views where the memory isn't allocated (aliases).
+    uint64_t alias_pages;
+    // Guest accesses that hit a read watch, by view (A0000000, C0000000,
+    // E0000000), and those of them through a view where the memory isn't
+    // allocated.
+    uint64_t faults_by_view[3];
+    uint64_t alias_faults;
+  };
+  ReadWatchStats TakeReadWatchStats() {
+    ReadWatchStats stats;
+    stats.alias_pages = read_watch_alias_pages_.exchange(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < 3; ++i) {
+      stats.faults_by_view[i] = read_watch_faults_by_view_[i].exchange(0, std::memory_order_relaxed);
+    }
+    stats.alias_faults = read_watch_alias_faults_.exchange(0, std::memory_order_relaxed);
+    return stats;
+  }
+
   // Returns start and length of the smallest physical memory region surrounding
   // the watched region that can be safely unwatched, if it doesn't matter,
   // return (0, UINT32_MAX).
@@ -673,6 +704,9 @@ class Memory {
   // Read-watched system pages in all views.
   std::atomic<uint32_t> read_watched_page_count_{0};
   uint32_t read_watch_faults_logged_ = 0;
+  std::atomic<uint64_t> read_watch_alias_pages_{0};
+  std::atomic<uint64_t> read_watch_faults_by_view_[3] = {};
+  std::atomic<uint64_t> read_watch_alias_faults_{0};
 };
 
 }  // namespace rex::memory

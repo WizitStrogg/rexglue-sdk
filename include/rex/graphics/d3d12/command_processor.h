@@ -242,6 +242,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
   void PrepareForWait() override;
   void PrepareGuestMemoryReadByGpu(uint32_t physical_address, uint32_t length) override;
+  void PrepareGuestMemoryReadByCommandProcessor(uint32_t physical_address, uint32_t length,
+                                                diag::CpMemoryRead kind) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -422,6 +424,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   static void LazyReadbackDataProviderThunk(void* context, uint32_t physical_address,
                                             uint32_t length);
   void ProvideLazyReadbackData(uint32_t physical_address, uint32_t length);
+  // readback_memexport_lazy_apply_thread: puts each copy in guest memory as
+  // soon as the GPU has completed it.
+  void StartLazyApplyThread();
+  void StopLazyApplyThread();
+  void LazyApplyThreadMain();
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
@@ -893,6 +900,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<std::pair<uint32_t, uint32_t>> lazy_readback_applied_ranges_;
   // Size of lazy_readbacks_, readable without the lock.
   std::atomic<uint32_t> lazy_readback_count_{0};
+  // Bounds of the physical memory lazy_readbacks_ cover (empty when start >=
+  // end), modified with the global critical region locked, for checks by the
+  // command processor without it.
+  std::atomic<uint32_t> lazy_readback_bounds_start_{UINT32_MAX};
+  std::atomic<uint32_t> lazy_readback_bounds_end_{0};
+  std::thread lazy_apply_thread_;
+  std::mutex lazy_apply_mutex_;
+  std::condition_variable lazy_apply_cond_;
+  bool lazy_apply_thread_exit_ = false;
+  HANDLE lazy_apply_event_ = nullptr;
 };
 
 }  // namespace rex::graphics::d3d12

@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/frame_limiter.h>
 #include <rex/graphics/guest_frame_meter.h>
@@ -177,6 +178,12 @@ class CommandProcessor {
   // written (memory polled by WAIT_REG_MEM and COND_WRITE).
   virtual void PrepareGuestMemoryReadByGpu(uint32_t /* physical_address */,
                                            uint32_t /* length */) {}
+  // Before the command processor reads guest memory the guest GPU may have
+  // written, to execute it (constants loaded from memory, shaders, indirect
+  // buffers).
+  virtual void PrepareGuestMemoryReadByCommandProcessor(uint32_t /* physical_address */,
+                                                        uint32_t /* length */,
+                                                        diag::CpMemoryRead /* kind */) {}
 
   // Asynchronous guest-visible writes: instead of waiting for the GPU before a
   // fence write or an interrupt that the CPU may follow by reading GPU results,

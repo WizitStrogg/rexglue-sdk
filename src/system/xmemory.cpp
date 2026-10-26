@@ -40,6 +40,12 @@ REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from re
 REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
                     "Protect released memory to prevent accesses");
 
+REXCVAR_DEFINE_BOOL(read_watch_aliases, true, "Memory",
+                    "Read watches (GPU results still being copied back) also cover the views of "
+                    "physical memory where it isn't allocated, which stay accessible unless "
+                    "protect_on_release is enabled, so reading through any view waits for the data")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
 namespace rex::memory {
@@ -561,6 +567,15 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     // Data being copied back from the host GPU. Retried afterwards, and a write
     // to a page watched for invalidation faults again and is handled as such.
     LogReadWatchFault(virtual_address, is_write);
+    if (virtual_address >= 0xA0000000) {
+      read_watch_faults_by_view_[std::min((virtual_address - 0xA0000000) >> 29, uint32_t(2))]
+          .fetch_add(1, std::memory_order_relaxed);
+    }
+    HeapAllocationInfo alias_info{};
+    if (physical_heap->QueryRegionInfo(virtual_address, &alias_info) &&
+        !(alias_info.state & memory::kMemoryAllocationCommit)) {
+      read_watch_alias_faults_.fetch_add(1, std::memory_order_relaxed);
+    }
     uint32_t physical_page =
         GetPhysicalAddress(virtual_address) & ~(uint32_t(system_page_size_) - 1);
     ProvidePhysicalMemoryData(physical_page, system_page_size_);
@@ -1053,6 +1068,11 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
     // is safe; restoring write access loses invalidations, which is not.
     if (access == rex::memory::PageAccess::kReadWrite && IsHostPageWriteWatched(host_page_number)) {
       access = rex::memory::PageAccess::kReadOnly;
+    }
+    // A read-watched page stays inaccessible until its data is provided, or
+    // reads would see stale data without faulting.
+    if (IsHostPageReadWatched(host_page_number)) {
+      access = rex::memory::PageAccess::kNoAccess;
     }
     return access;
   };
@@ -2268,6 +2288,8 @@ uint32_t PhysicalHeap::EnableReadWatches(uint32_t physical_address, uint32_t len
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
   uint32_t watched_count = 0;
+  uint32_t alias_count = 0;
+  const bool watch_aliases = REXCVAR_GET(read_watch_aliases);
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     SystemPageFlagsBlock& page_flags_block = system_page_flags_[i >> 6];
@@ -2275,15 +2297,23 @@ uint32_t PhysicalHeap::EnableReadWatches(uint32_t physical_address, uint32_t len
     bool protect_system_page = false;
     if (!(page_flags_block.read_watched & page_flags_bit)) {
       // Only where the guest can access the memory through this view - other
-      // pages need real access violations.
+      // pages need real access violations. With read_watch_aliases, that
+      // includes views where the memory isn't allocated but left accessible.
       uint32_t guest_page_number =
           rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-      if (guest_page_number < page_table_.size() &&
-          ToPageAccess(page_table_[guest_page_number].current_protect) !=
-              rex::memory::PageAccess::kNoAccess) {
-        page_flags_block.read_watched |= page_flags_bit;
-        protect_system_page = true;
-        ++watched_count;
+      if (guest_page_number < page_table_.size()) {
+        bool is_alias = !(page_table_[guest_page_number].state & memory::kMemoryAllocationCommit);
+        rex::memory::PageAccess access =
+            watch_aliases ? GetUnwatchedPageAccess(guest_page_number)
+                          : ToPageAccess(page_table_[guest_page_number].current_protect);
+        if (access != rex::memory::PageAccess::kNoAccess) {
+          page_flags_block.read_watched |= page_flags_bit;
+          protect_system_page = true;
+          ++watched_count;
+          if (is_alias) {
+            ++alias_count;
+          }
+        }
       }
     }
     if (protect_system_page) {
@@ -2301,6 +2331,9 @@ uint32_t PhysicalHeap::EnableReadWatches(uint32_t physical_address, uint32_t len
     rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          rex::memory::PageAccess::kNoAccess);
+  }
+  if (alias_count) {
+    memory_->read_watch_alias_pages_.fetch_add(alias_count, std::memory_order_relaxed);
   }
   return watched_count;
 }
@@ -2334,7 +2367,7 @@ uint32_t PhysicalHeap::DisableReadWatches(uint32_t physical_address, uint32_t le
     uint32_t guest_page_number =
         rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
     rex::memory::PageAccess access = guest_page_number < page_table_.size()
-                                         ? ToPageAccess(page_table_[guest_page_number].current_protect)
+                                         ? GetUnwatchedPageAccess(guest_page_number)
                                          : rex::memory::PageAccess::kNoAccess;
     if (access == rex::memory::PageAccess::kReadWrite &&
         (page_flags_block.notify_on_invalidation & page_flags_bit)) {
@@ -2543,6 +2576,24 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
   }
   return (system_page_flags_[host_page_number >> 6].notify_on_invalidation &
           (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+bool PhysicalHeap::IsHostPageReadWatched(uint32_t host_page_number) const {
+  if (host_page_number >= system_page_count_) {
+    return false;
+  }
+  return (system_page_flags_[host_page_number >> 6].read_watched &
+          (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+rex::memory::PageAccess PhysicalHeap::GetUnwatchedPageAccess(uint32_t guest_page_number) const {
+  const PageEntry& page_entry = page_table_[guest_page_number];
+  if (page_entry.state & memory::kMemoryAllocationCommit) {
+    return ToPageAccess(page_entry.current_protect);
+  }
+  // As BaseHeap::SyncHostPageAccess leaves them.
+  return REXCVAR_GET(protect_on_release) ? rex::memory::PageAccess::kNoAccess
+                                         : rex::memory::PageAccess::kReadWrite;
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {

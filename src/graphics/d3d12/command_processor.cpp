@@ -97,6 +97,19 @@ REXCVAR_DEFINE_BOOL(readback_memexport_lazy_delay_writes, false, "GPU/D3D12",
                     "readback_memexport_async does")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_cp_reads, true, "GPU/D3D12",
+                    "With readback_memexport_lazy, before the command processor reads guest "
+                    "memory to execute it (constants loaded from memory, shaders, indirect "
+                    "buffers), put memexport results there still being copied back, or not "
+                    "copied back yet, in guest memory first")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_apply_thread, false, "GPU/D3D12",
+                    "With readback_memexport_lazy, put each copy in guest memory as soon as the "
+                    "GPU has completed it, on a thread of its own, rather than when the command "
+                    "processor next checks or the guest touches the memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submission_thread, false, "GPU/D3D12",
                     "Replay and submit command lists on a separate thread, so the graphics "
                     "driver's work runs in parallel with command processing")
@@ -1713,6 +1726,7 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   FlushSubmissionThread();
   AwaitAllQueueOperationsCompletion();
+  StopLazyApplyThread();
   {
     auto global_lock = rex::thread::global_critical_region::AcquireDirect();
     ApplyCompletedLazyReadbacks(UINT64_MAX);
@@ -2931,6 +2945,121 @@ void D3D12CommandProcessor::PrepareGuestMemoryReadByGpu(uint32_t physical_addres
   AwaitLazyReadbacks(physical_address, length);
 }
 
+void D3D12CommandProcessor::PrepareGuestMemoryReadByCommandProcessor(uint32_t physical_address,
+                                                                     uint32_t length,
+                                                                     diag::CpMemoryRead kind) {
+  if (!length || !REXCVAR_GET(readback_memexport_lazy)) {
+    return;
+  }
+  const bool make_current = REXCVAR_GET(readback_memexport_lazy_cp_reads);
+  uint32_t end = physical_address + length;
+  // Written by the GPU since the last readback, so only in its copy.
+  for (const draw_util::MemExportRange& range : memexport_readback_deferred_ranges_) {
+    uint32_t range_start = range.base_address_dwords << 2;
+    if (range_start < end && physical_address < range_start + range.size_bytes) {
+      diag::cp_reads_of_unissued_memexport[size_t(kind)].fetch_add(1, std::memory_order_relaxed);
+      if (make_current) {
+        IssueLazyMemexportReadback();
+      }
+      break;
+    }
+  }
+  // Only the command processor adds readbacks, so these only shrink meanwhile.
+  if (!lazy_readback_count_.load(std::memory_order_relaxed) ||
+      lazy_readback_bounds_start_.load(std::memory_order_relaxed) >= end ||
+      physical_address >= lazy_readback_bounds_end_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  uint64_t submission;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    submission = GetLazyReadbackSubmission(physical_address, length);
+  }
+  if (!submission) {
+    return;
+  }
+  diag::cp_reads_of_pending_memexport[size_t(kind)].fetch_add(1, std::memory_order_relaxed);
+  if (make_current) {
+    // Applies the completed readbacks.
+    CheckSubmissionFence(submission);
+  }
+}
+
+void D3D12CommandProcessor::StartLazyApplyThread() {
+  if (lazy_apply_thread_.joinable()) {
+    return;
+  }
+  if (!lazy_apply_event_) {
+    lazy_apply_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!lazy_apply_event_) {
+      return;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(lazy_apply_mutex_);
+    lazy_apply_thread_exit_ = false;
+  }
+  lazy_apply_thread_ = std::thread([this]() { LazyApplyThreadMain(); });
+}
+
+void D3D12CommandProcessor::StopLazyApplyThread() {
+  if (lazy_apply_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(lazy_apply_mutex_);
+      lazy_apply_thread_exit_ = true;
+    }
+    lazy_apply_cond_.notify_all();
+    lazy_apply_thread_.join();
+  }
+  if (lazy_apply_event_) {
+    CloseHandle(lazy_apply_event_);
+    lazy_apply_event_ = nullptr;
+  }
+}
+
+void D3D12CommandProcessor::LazyApplyThreadMain() {
+  rex::thread::set_current_thread_name("Lazy memexport readback apply");
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(lazy_apply_mutex_);
+      if (lazy_apply_thread_exit_) {
+        return;
+      }
+      if (!REXCVAR_GET(readback_memexport_lazy_apply_thread) ||
+          !lazy_readback_count_.load(std::memory_order_relaxed)) {
+        // Timed, as the readbacks are counted without this mutex.
+        lazy_apply_cond_.wait_for(lock, std::chrono::milliseconds(20));
+        continue;
+      }
+    }
+    uint64_t oldest_submission = 0;
+    {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (!lazy_readbacks_.empty()) {
+        oldest_submission = lazy_readbacks_.front().submission;
+      }
+    }
+    if (!oldest_submission) {
+      // Applied meanwhile by another thread.
+      continue;
+    }
+    if (submission_fence_->GetCompletedValue() < oldest_submission) {
+      // Timed, to notice the exit request.
+      if (SUCCEEDED(submission_fence_->SetEventOnCompletion(oldest_submission,
+                                                            lazy_apply_event_))) {
+        WaitForSingleObject(lazy_apply_event_, 20);
+      }
+      continue;
+    }
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    uint32_t count_before = lazy_readback_count_.load(std::memory_order_relaxed);
+    ApplyCompletedLazyReadbacks(submission_fence_->GetCompletedValue());
+    diag::lazy_readbacks_applied_by_thread.fetch_add(
+        count_before - lazy_readback_count_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+  }
+}
+
 uint64_t D3D12CommandProcessor::IssueLazyMemexportReadback() {
   if (memexport_readback_deferred_ranges_.empty()) {
     return 0;
@@ -3004,6 +3133,15 @@ uint64_t D3D12CommandProcessor::IssueLazyMemexportReadback() {
     lazy_readbacks_.push_back(
         {submission, buffer_index, std::move(memexport_readback_deferred_ranges_)});
     lazy_readback_count_.fetch_add(1, std::memory_order_relaxed);
+    uint32_t bounds_start = lazy_readback_bounds_start_.load(std::memory_order_relaxed);
+    uint32_t bounds_end = lazy_readback_bounds_end_.load(std::memory_order_relaxed);
+    for (const draw_util::MemExportRange& memexport_range : lazy_readbacks_.back().ranges) {
+      uint32_t range_start = memexport_range.base_address_dwords << 2;
+      bounds_start = std::min(bounds_start, range_start);
+      bounds_end = std::max(bounds_end, range_start + memexport_range.size_bytes);
+    }
+    lazy_readback_bounds_start_.store(bounds_start, std::memory_order_relaxed);
+    lazy_readback_bounds_end_.store(bounds_end, std::memory_order_relaxed);
     if (REXCVAR_GET(readback_memexport_lazy_watch)) {
       for (const draw_util::MemExportRange& memexport_range : lazy_readbacks_.back().ranges) {
         memory_->EnablePhysicalMemoryReadWatches(memexport_range.base_address_dwords << 2,
@@ -3017,6 +3155,9 @@ uint64_t D3D12CommandProcessor::IssueLazyMemexportReadback() {
   if (REXCVAR_GET(readback_memexport_lazy_await)) {
     // Applies it.
     CheckSubmissionFence(submission);
+  } else if (REXCVAR_GET(readback_memexport_lazy_apply_thread)) {
+    StartLazyApplyThread();
+    lazy_apply_cond_.notify_one();
   }
   return submission;
 }
@@ -3126,6 +3267,10 @@ void D3D12CommandProcessor::ApplyCompletedLazyReadbacks(uint64_t completed_submi
     buffer.in_use = false;
     lazy_readbacks_.pop_front();
     lazy_readback_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+  if (lazy_readbacks_.empty()) {
+    lazy_readback_bounds_start_.store(UINT32_MAX, std::memory_order_relaxed);
+    lazy_readback_bounds_end_.store(0, std::memory_order_relaxed);
   }
   // Pages that newer pending readbacks also cover stay watched.
   const uint32_t page_size_log2 = 12;

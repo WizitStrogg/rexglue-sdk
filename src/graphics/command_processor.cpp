@@ -844,14 +844,18 @@ void CommandProcessor::LogAsyncGuestWriteDiag() {
     return;
   }
   const AsyncGuestWriteDiag& d = async_diag_;
+  const memory::Memory::ReadWatchStats read_watch_stats = memory_->TakeReadWatchStats();
   REXGPU_INFO(
       "Guest-visible writes in 5 s: {} swaps; queued {} counter / {} value events, {} mem "
       "writes, {} interrupts; {} counter events immediate; {} immediate; {} drains; waits: {} "
       "satisfied by queued writes, {} drains; {} queued register/conditional writes; {} queued "
-      "stores skipped for newer CPU writes; {}",
+      "stores skipped for newer CPU writes; read watches: {} alias pages watched, faults through "
+      "A0000000/C0000000/E0000000 {}/{}/{} ({} through aliases); {}",
       d.swaps, d.counter_events, d.value_events, d.mem_writes, d.interrupts, d.counter_immediate,
       d.immediate, d.drains, d.wait_queue_hits, d.wait_drains, d.cond_writes,
-      d.stores_kept_cpu_value, diag::TakeSummary());
+      d.stores_kept_cpu_value, read_watch_stats.alias_pages, read_watch_stats.faults_by_view[0],
+      read_watch_stats.faults_by_view[1], read_watch_stats.faults_by_view[2],
+      read_watch_stats.alias_faults, diag::TakeSummary());
   async_diag_ = {};
   async_diag_last_log_ = now;
 }
@@ -1066,6 +1070,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  PrepareGuestMemoryReadByCommandProcessor(ptr & 0x1FFFFFFF, count * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kIndirectBuffer);
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -2023,6 +2029,8 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
+  PrepareGuestMemoryReadByCommandProcessor(address & 0x1FFFFFFF, size_dwords * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kConstants);
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
   switch (type) {
     case 0:  // ALU
@@ -2068,6 +2076,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
+  PrepareGuestMemoryReadByCommandProcessor(addr & 0x1FFFFFFF, size_dwords * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kShader);
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
   switch (shader_type) {
