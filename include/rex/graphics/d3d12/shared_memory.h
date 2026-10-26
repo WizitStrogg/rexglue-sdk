@@ -80,6 +80,7 @@ class D3D12SharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  void RangeAccessedByGpu(uint32_t start, uint32_t length) override;
 
  private:
   D3D12CommandProcessor& command_processor_;
@@ -93,6 +94,17 @@ class D3D12SharedMemory : public SharedMemory {
   // Diagnostics: pages uploaded in the guest frame uploaded_in_frame_index_.
   std::vector<uint64_t> uploaded_in_frame_;
   uint64_t uploaded_in_frame_index_ = 0;
+  // shared_memory_upload_prefetch: pages the GPU used in the guest frame
+  // used_in_frame_index_, and those it used in the previous frame not
+  // uploaded with a batch yet in this one.
+  void UpdateUsedPagesFrame();
+  std::vector<uint64_t> used_in_frame_;
+  std::vector<uint64_t> prefetch_candidates_;
+  std::vector<uint32_t> prefetch_candidate_blocks_;
+  uint64_t prefetch_generation_seen_ = UINT64_MAX;
+  uint64_t used_in_frame_index_ = UINT64_MAX;
+  std::vector<std::pair<uint32_t, uint32_t>> prefetch_ranges_;
+  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_with_prefetch_;
   D3D12_RESOURCE_STATES buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
   bool buffer_uav_writes_commit_needed_ = false;
   void CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES new_state);

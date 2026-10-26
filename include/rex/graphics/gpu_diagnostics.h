@@ -48,6 +48,10 @@ class ScopedUploadReason {
 };
 // Pages uploaded again in the same guest frame.
 inline std::atomic<uint64_t> pages_reuploaded_in_frame{0};
+// shared_memory_upload_prefetch: pages the GPU used in the previous frame
+// uploaded along with a batch before being requested, and the batches.
+inline std::atomic<uint64_t> prefetched_pages{0};
+inline std::atomic<uint64_t> prefetch_batches{0};
 // Invalidations of shared memory by CPU writes (and other guest memory
 // changes), and the pages invalidated (with the expansion around them).
 inline std::atomic<uint64_t> cpu_invalidations{0};
@@ -265,7 +269,7 @@ inline std::string TakeSummary() {
   return fmt::format(
       "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB (by reason, "
       "vertices/indices/memexport/textures/resolves/other: {}; pages uploaded again in the "
-      "frame {}), CPU write invalidations {} ({} pages), CPU writes to "
+      "frame {}; prefetched {} pages in {} batches), CPU write invalidations {} ({} pages), CPU writes to "
       "GPU-written pages {}, merged uploads {} pages / {} dwords, uploads keeping pending "
       "readback data {} ({} KB), uploads over unread memexport results {} ({} KB), {} "
       "submissions, GPU busy {} ms, command processor GPU "
@@ -280,6 +284,7 @@ inline std::string TakeSummary() {
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, upload_batches.exchange(0), upload_bytes.exchange(0) >> 10,
       TakeUploadReasonSummary(), pages_reuploaded_in_frame.exchange(0),
+      prefetched_pages.exchange(0), prefetch_batches.exchange(0),
       cpu_invalidations.exchange(0), cpu_invalidated_pages.exchange(0),
       cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0),
