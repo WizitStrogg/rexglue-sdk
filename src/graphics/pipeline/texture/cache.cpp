@@ -18,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/gpu_diagnostics.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -573,6 +574,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }
+    diag::ScopedUploadReason upload_reason(diag::UploadReason::kTextures);
     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
   }
@@ -892,6 +894,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   for (size_t i = 0; i < pending_range_count; ++i) {
     pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
   }
+  diag::ScopedUploadReason upload_reason(diag::UploadReason::kTextures);
   if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count)) {
     return false;
   }

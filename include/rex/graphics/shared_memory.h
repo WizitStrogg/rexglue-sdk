@@ -156,6 +156,18 @@ class SharedMemory {
   // Moves out the snapshot for the page if there is one.
   bool TakeCpuWriteSnapshot(uint32_t page, std::vector<uint32_t>& snapshot_out);
 
+  // Takes up to max_pages of the pages set in `candidates` (a bit per page,
+  // cleared as taken) that aren't valid, appending them to ranges_out as
+  // (first page, page count) in ascending order. candidate_blocks lists the
+  // blocks of `candidates` that may have bits set, in ascending order, and
+  // empty ones are removed from it. Does nothing if no pages have been
+  // invalidated since the call that set generation_seen, which is set when all
+  // the candidates have been checked. Returns the number of pages taken.
+  uint32_t TakeInvalidPages(std::vector<uint64_t>& candidates,
+                            std::vector<uint32_t>& candidate_blocks, uint32_t max_pages,
+                            std::vector<std::pair<uint32_t, uint32_t>>& ranges_out,
+                            uint64_t& generation_seen);
+
  private:
   memory::Memory& memory_;
 
@@ -192,6 +204,8 @@ class SharedMemory {
 
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;
+  // Incremented when pages are invalidated, for TakeInvalidPages.
+  uint64_t invalidation_generation_ = 0;
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;

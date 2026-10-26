@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cinttypes>
 #include <cmath>
@@ -64,6 +65,15 @@ REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
                      "milliseconds, write the current GPU counter to where the last counter "
                      "event wrote it, if it has advanced, so a guest polling that counter for a "
                      "fence can't wait forever for commands it hasn't submitted (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(wait_reg_mem_spin_us, 2000, "GPU",
+                     "With vsync, a WAIT_REG_MEM that isn't satisfied yet first polls the "
+                     "value for up to this many microseconds, yielding the CPU between "
+                     "checks, before sleeping for the wait time the packet asks for, so the "
+                     "command processor resumes as soon as the guest writes the value "
+                     "(0 = sleep right away)")
+    .range(0, 20000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
@@ -503,6 +513,16 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+// The registers in register_table.inc, a bit each (RegisterFile::GetRegisterInfo
+// is too slow for every register write).
+static constexpr auto kKnownRegisters = [] {
+  std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> bits{};
+#define XE_GPU_REGISTER(index, type, name) bits[(index) >> 6] |= uint64_t(1) << ((index) & 63);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return bits;
+}();
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -518,7 +538,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!(kKnownRegisters[index >> 6] & (uint64_t(1) << (index & 63)))) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -844,14 +864,18 @@ void CommandProcessor::LogAsyncGuestWriteDiag() {
     return;
   }
   const AsyncGuestWriteDiag& d = async_diag_;
+  const memory::Memory::ReadWatchStats read_watch_stats = memory_->TakeReadWatchStats();
   REXGPU_INFO(
       "Guest-visible writes in 5 s: {} swaps; queued {} counter / {} value events, {} mem "
       "writes, {} interrupts; {} counter events immediate; {} immediate; {} drains; waits: {} "
       "satisfied by queued writes, {} drains; {} queued register/conditional writes; {} queued "
-      "stores skipped for newer CPU writes; {}",
+      "stores skipped for newer CPU writes; read watches: {} alias pages watched, faults through "
+      "A0000000/C0000000/E0000000 {}/{}/{} ({} through aliases); {}",
       d.swaps, d.counter_events, d.value_events, d.mem_writes, d.interrupts, d.counter_immediate,
       d.immediate, d.drains, d.wait_queue_hits, d.wait_drains, d.cond_writes,
-      d.stores_kept_cpu_value, diag::TakeSummary());
+      d.stores_kept_cpu_value, read_watch_stats.alias_pages, read_watch_stats.faults_by_view[0],
+      read_watch_stats.faults_by_view[1], read_watch_stats.faults_by_view[2],
+      read_watch_stats.alias_faults, diag::TakeSummary());
   async_diag_ = {};
   async_diag_last_log_ = now;
 }
@@ -1066,6 +1090,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  PrepareGuestMemoryReadByCommandProcessor(ptr & 0x1FFFFFFF, count * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kIndirectBuffer);
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -1132,6 +1158,11 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && count > 1) {
+    // Consecutive registers: the backend handles constant ranges at once.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -1477,7 +1508,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool matched = false;
   bool value_from_queue = false;
   bool counted_queue_hit = false;
-  do {
+  auto poll = [&]() {
     uint32_t value = 0;
     if (is_memory) {
       PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
@@ -1524,6 +1555,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+  };
+  do {
+    poll();
     if (matched && value_from_queue && !counted_queue_hit) {
       ++async_diag_.wait_queue_hits;
       counted_queue_hit = true;
@@ -1566,7 +1600,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          const int32_t spin_us = REXCVAR_GET(wait_reg_mem_spin_us);
+          if (spin_us > 0) {
+            const auto spin_end =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+            do {
+              rex::thread::MaybeYield();
+              poll();
+            } while (!matched && std::chrono::steady_clock::now() < spin_end);
+          }
+          if (!matched) {
+            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          }
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
@@ -2023,6 +2068,8 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
+  PrepareGuestMemoryReadByCommandProcessor(address & 0x1FFFFFFF, size_dwords * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kConstants);
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
   switch (type) {
     case 0:  // ALU
@@ -2068,6 +2115,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
+  PrepareGuestMemoryReadByCommandProcessor(addr & 0x1FFFFFFF, size_dwords * sizeof(uint32_t),
+                                           diag::CpMemoryRead::kShader);
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
   switch (shader_type) {

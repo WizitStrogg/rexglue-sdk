@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,17 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(shared_memory_upload_prefetch, true, "GPU/D3D12",
+                    "When guest memory has to be uploaded for the GPU, also upload the pages the "
+                    "GPU used in the previous frame that the CPU has changed since, in the same "
+                    "batch, so the following draws don't each need a batch of their own (each "
+                    "batch makes the GPU wait for the shared memory buffer transitions)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(shared_memory_upload_prefetch_max_kb, 16384, "GPU/D3D12",
+                     "Most memory shared_memory_upload_prefetch uploads with one batch, in KB")
+    .range(4, 524288)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
@@ -302,11 +315,85 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   return true;
 }
 
+void D3D12SharedMemory::UpdateUsedPagesFrame() {
+  uint64_t frame = command_processor_.GetCurrentFrame();
+  if (used_in_frame_index_ == frame) {
+    return;
+  }
+  size_t block_count = (kBufferSize >> page_size_log2()) >> 6;
+  if (used_in_frame_index_ + 1 == frame && used_in_frame_.size() == block_count) {
+    prefetch_candidates_.swap(used_in_frame_);
+  } else {
+    prefetch_candidates_.assign(block_count, 0);
+  }
+  prefetch_candidate_blocks_.clear();
+  for (uint32_t i = 0; i < uint32_t(prefetch_candidates_.size()); ++i) {
+    if (prefetch_candidates_[i]) {
+      prefetch_candidate_blocks_.push_back(i);
+    }
+  }
+  prefetch_generation_seen_ = UINT64_MAX;
+  used_in_frame_.assign(block_count, 0);
+  used_in_frame_index_ = frame;
+}
+
+void D3D12SharedMemory::RangeAccessedByGpu(uint32_t start, uint32_t length) {
+  if (!length || !REXCVAR_GET(shared_memory_upload_prefetch)) {
+    return;
+  }
+  UpdateUsedPagesFrame();
+  uint32_t page_first = start >> page_size_log2();
+  uint32_t page_last = std::min((start + (length - 1)) >> page_size_log2(),
+                                uint32_t(used_in_frame_.size() << 6) - 1);
+  for (uint32_t i = page_first >> 6; i <= page_last >> 6; ++i) {
+    uint64_t bits = UINT64_MAX;
+    if (i == page_first >> 6) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == page_last >> 6 && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    used_in_frame_[i] |= bits;
+  }
+}
+
 bool D3D12SharedMemory::UploadRanges(
-    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
-  if (upload_page_ranges.empty()) {
+    const std::vector<std::pair<uint32_t, uint32_t>>& requested_page_ranges) {
+  if (requested_page_ranges.empty()) {
     return true;
   }
+  // Pages the GPU used in the previous frame and the CPU has changed since go
+  // in this batch too, rather than each in a batch of its own later.
+  const std::vector<std::pair<uint32_t, uint32_t>>* upload_page_ranges_pointer =
+      &requested_page_ranges;
+  if (REXCVAR_GET(shared_memory_upload_prefetch)) {
+    UpdateUsedPagesFrame();
+    // Being uploaded anyway.
+    for (const std::pair<uint32_t, uint32_t>& range : requested_page_ranges) {
+      for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+        if ((page >> 6) < prefetch_candidates_.size()) {
+          prefetch_candidates_[page >> 6] &= ~(uint64_t(1) << (page & 63));
+        }
+      }
+    }
+    prefetch_ranges_.clear();
+    uint32_t prefetch_max_pages =
+        uint32_t(REXCVAR_GET(shared_memory_upload_prefetch_max_kb)) >> (page_size_log2() - 10);
+    uint32_t prefetched = TakeInvalidPages(
+        prefetch_candidates_, prefetch_candidate_blocks_, std::max(prefetch_max_pages, uint32_t(1)),
+        prefetch_ranges_, prefetch_generation_seen_);
+    if (prefetched) {
+      diag::prefetched_pages.fetch_add(prefetched, std::memory_order_relaxed);
+      diag::prefetch_batches.fetch_add(1, std::memory_order_relaxed);
+      upload_ranges_with_prefetch_.clear();
+      std::merge(requested_page_ranges.begin(), requested_page_ranges.end(),
+                 prefetch_ranges_.begin(), prefetch_ranges_.end(),
+                 std::back_inserter(upload_ranges_with_prefetch_));
+      upload_page_ranges_pointer = &upload_ranges_with_prefetch_;
+    }
+  }
+  const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges =
+      *upload_page_ranges_pointer;
   D3D12CommandProcessor::GpuProfileScope profile_scope = command_processor_.BeginGpuProfileScope();
   struct ProfileScopeEnd {
     D3D12CommandProcessor& command_processor;
@@ -319,6 +406,33 @@ bool D3D12SharedMemory::UploadRanges(
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
   diag::upload_batches.fetch_add(1, std::memory_order_relaxed);
+  const size_t upload_reason_index = size_t(diag::upload_reason);
+  diag::upload_batches_by_reason[upload_reason_index].fetch_add(1, std::memory_order_relaxed);
+  auto count_upload_bytes = [upload_reason_index](size_t size) {
+    diag::upload_bytes.fetch_add(size, std::memory_order_relaxed);
+    diag::upload_bytes_by_reason[upload_reason_index].fetch_add(size, std::memory_order_relaxed);
+  };
+  {
+    // Pages uploaded more than once in a frame.
+    uint64_t frame = command_processor_.GetCurrentFrame();
+    if (uploaded_in_frame_index_ != frame) {
+      uploaded_in_frame_index_ = frame;
+      uploaded_in_frame_.assign((kBufferSize >> page_size_log2()) >> 6, 0);
+    }
+    uint64_t reuploaded = 0;
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+      for (uint32_t page = upload_range.first; page < upload_range.first + upload_range.second;
+           ++page) {
+        uint64_t& block = uploaded_in_frame_[page >> 6];
+        uint64_t bit = uint64_t(1) << (page & 63);
+        reuploaded += (block & bit) != 0;
+        block |= bit;
+      }
+    }
+    if (reuploaded) {
+      diag::pages_reuploaded_in_frame.fetch_add(reuploaded, std::memory_order_relaxed);
+    }
+  }
 
   // Copies [start, start + length) (dword-aligned) from guest memory.
   auto upload_bytes = [&](uint32_t start, uint32_t length) -> bool {
@@ -335,7 +449,7 @@ bool D3D12SharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping, memory().TranslatePhysical(start), upload_buffer_size);
       command_list.D3DCopyBufferRegion(buffer_, start, upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
-      diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
+      count_upload_bytes(upload_buffer_size);
       start += uint32_t(upload_buffer_size);
       length -= uint32_t(upload_buffer_size);
     }
@@ -389,7 +503,7 @@ bool D3D12SharedMemory::UploadRanges(
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
-      diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
+      count_upload_bytes(upload_buffer_size);
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
@@ -450,7 +564,7 @@ bool D3D12SharedMemory::UploadRanges(
         command_list.D3DCopyBufferRegion(buffer_, page_address + i * sizeof(uint32_t),
                                          upload_buffer, UINT64(upload_buffer_offset),
                                          UINT64(upload_buffer_size));
-        diag::upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
+        count_upload_bytes(upload_buffer_size);
         i += uint32_t(upload_buffer_size / sizeof(uint32_t));
       }
     }

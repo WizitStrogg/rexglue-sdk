@@ -386,8 +386,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  // Reused, as this is called for most draws.
+  thread_local std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  merged_ranges.clear();
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -405,10 +406,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 
   SCOPE_profile_cpu_f("gpu");
 
-  std::sort(merged_ranges.begin(), merged_ranges.end(),
-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
-              return a.first < b.first;
-            });
+  if (merged_ranges.size() > 1) {
+    std::sort(merged_ranges.begin(), merged_ranges.end(),
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                return a.first < b.first;
+              });
+  }
   size_t merged_write = 0;
   for (size_t i = 1; i < merged_ranges.size(); ++i) {
     std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
@@ -511,6 +514,52 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   return successful;
 }
 
+uint32_t SharedMemory::TakeInvalidPages(std::vector<uint64_t>& candidates,
+                                        std::vector<uint32_t>& candidate_blocks,
+                                        uint32_t max_pages,
+                                        std::vector<std::pair<uint32_t, uint32_t>>& ranges_out,
+                                        uint64_t& generation_seen) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (generation_seen == invalidation_generation_) {
+    return 0;
+  }
+  uint32_t taken = 0;
+  size_t blocks_kept = 0;
+  for (uint32_t i : candidate_blocks) {
+    if (i >= candidates.size()) {
+      continue;
+    }
+    if (taken < max_pages && i < system_page_flags_valid_.size()) {
+      uint64_t bits = candidates[i] & ~system_page_flags_valid_[i];
+      while (bits && taken < max_pages) {
+        uint32_t bit = uint32_t(std::countr_zero(bits));
+        uint32_t run_length =
+            std::min(uint32_t(std::countr_one(bits >> bit)), max_pages - taken);
+        uint64_t run_mask =
+            (run_length >= 64 ? UINT64_MAX : (uint64_t(1) << run_length) - 1) << bit;
+        bits &= ~run_mask;
+        candidates[i] &= ~run_mask;
+        uint32_t page = (i << 6) + bit;
+        if (!ranges_out.empty() && ranges_out.back().first + ranges_out.back().second == page) {
+          ranges_out.back().second += run_length;
+        } else {
+          ranges_out.emplace_back(page, run_length);
+        }
+        taken += run_length;
+      }
+    }
+    if (candidates[i]) {
+      candidate_blocks[blocks_kept++] = i;
+    }
+  }
+  candidate_blocks.resize(blocks_kept);
+  if (taken < max_pages) {
+    // All checked - the rest are valid until something is invalidated.
+    generation_seen = invalidation_generation_;
+  }
+  return taken;
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
@@ -597,8 +646,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
+  ++invalidation_generation_;
+
   FireWatches(page_first, page_last, false);
 
+  diag::cpu_invalidations.fetch_add(1, std::memory_order_relaxed);
+  diag::cpu_invalidated_pages.fetch_add(page_last - page_first + 1, std::memory_order_relaxed);
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
 }
