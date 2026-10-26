@@ -67,7 +67,7 @@ REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
                      "fence can't wait forever for commands it hasn't submitted (0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(wait_reg_mem_spin_us, 0, "GPU",
+REXCVAR_DEFINE_INT32(wait_reg_mem_spin_us, 2000, "GPU",
                      "With vsync, a WAIT_REG_MEM that isn't satisfied yet first polls the "
                      "value for up to this many microseconds, yielding the CPU between "
                      "checks, before sleeping for the wait time the packet asks for, so the "

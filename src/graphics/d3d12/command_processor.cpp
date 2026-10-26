@@ -110,7 +110,7 @@ REXCVAR_DEFINE_BOOL(readback_memexport_lazy_apply_thread, false, "GPU/D3D12",
                     "processor next checks or the guest touches the memory")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(d3d12_submission_thread, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
                     "Replay and submit command lists on a separate thread, so the graphics "
                     "driver's work runs in parallel with command processing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
