@@ -663,7 +663,7 @@ std::string Symbolize(uint64_t address) { return fmt::format("{:#x}", address); 
 #endif
 
 std::string TopFunctions(const std::unordered_map<uint64_t, uint32_t>& counts, uint64_t total,
-                         size_t max_shown = 8) {
+                         size_t max_shown = 8, double min_pct = 0.0) {
   std::unordered_map<std::string, uint32_t> by_name;
   for (const auto& [address, count] : counts) {
     by_name[Symbolize(address)] += count;
@@ -673,8 +673,15 @@ std::string TopFunctions(const std::unordered_map<uint64_t, uint32_t>& counts, u
             [](const auto& a, const auto& b) { return a.second > b.second; });
   std::string text;
   for (size_t i = 0; i < sorted.size() && i < max_shown; ++i) {
-    text += fmt::format("{}{} {:.0f}%", i ? ", " : "", sorted[i].first,
-                        total ? 100.0 * sorted[i].second / double(total) : 0.0);
+    double pct = total ? 100.0 * sorted[i].second / double(total) : 0.0;
+    if (pct < min_pct) {
+      break;
+    }
+    if (min_pct > 0.0) {
+      text += fmt::format("{}{} {:.1f}%", i ? ", " : "", sorted[i].first, pct);
+    } else {
+      text += fmt::format("{}{} {:.0f}%", i ? ", " : "", sorted[i].first, pct);
+    }
   }
   return text;
 }
@@ -750,9 +757,10 @@ void ReportHostSamples(const std::vector<Row>& rows,
     REXKRNL_WARN(
         "[load-prof-host] {} cpu {:.0f}% ({} samples in {:.1f} s) | at: {} | in own code: {} | "
         "inclusive: {}",
-        label, cpu_pct, sampled.samples, elapsed_s, TopFunctions(sampled.leaf, sampled.samples),
-        TopFunctions(sampled.own_frame, sampled.samples),
-        TopFunctions(sampled.inclusive, sampled.samples, 30));
+        label, cpu_pct, sampled.samples, elapsed_s,
+        TopFunctions(sampled.leaf, sampled.samples, 25, 0.5),
+        TopFunctions(sampled.own_frame, sampled.samples, 25, 0.5),
+        TopFunctions(sampled.inclusive, sampled.samples, 80, 1.0));
     std::unordered_map<std::string, uint32_t> by_text;
     for (const auto& [key, count] : sampled.chain) {
       std::string text;
@@ -776,7 +784,7 @@ void ReportHostSamples(const std::vector<Row>& rows,
     std::sort(chains.begin(), chains.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
     std::string chain_line;
-    for (size_t i = 0; i < chains.size() && i < 8; ++i) {
+    for (size_t i = 0; i < chains.size() && i < 25; ++i) {
       chain_line += fmt::format("{}{:.1f}%: {}", i ? " ;; " : "",
                                 100.0 * chains[i].second / double(sampled.samples),
                                 chains[i].first);

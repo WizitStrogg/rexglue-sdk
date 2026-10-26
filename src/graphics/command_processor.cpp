@@ -67,6 +67,15 @@ REXCVAR_DEFINE_INT32(gpu_idle_counter_refresh_ms, 0, "GPU",
                      "fence can't wait forever for commands it hasn't submitted (0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(wait_reg_mem_spin_us, 0, "GPU",
+                     "With vsync, a WAIT_REG_MEM that isn't satisfied yet first polls the "
+                     "value for up to this many microseconds, yielding the CPU between "
+                     "checks, before sleeping for the wait time the packet asks for, so the "
+                     "command processor resumes as soon as the guest writes the value "
+                     "(0 = sleep right away)")
+    .range(0, 20000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
                      "Host guest-frame swap limit in FPS (0 = unlimited). "
                      "VSync and guest timing may impose a lower rate.")
@@ -1499,7 +1508,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool matched = false;
   bool value_from_queue = false;
   bool counted_queue_hit = false;
-  do {
+  auto poll = [&]() {
     uint32_t value = 0;
     if (is_memory) {
       PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
@@ -1546,6 +1555,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+  };
+  do {
+    poll();
     if (matched && value_from_queue && !counted_queue_hit) {
       ++async_diag_.wait_queue_hits;
       counted_queue_hit = true;
@@ -1588,7 +1600,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          const int32_t spin_us = REXCVAR_GET(wait_reg_mem_spin_us);
+          if (spin_us > 0) {
+            const auto spin_end =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+            do {
+              rex::thread::MaybeYield();
+              poll();
+            } while (!matched && std::chrono::steady_clock::now() < spin_end);
+          }
+          if (!matched) {
+            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          }
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
