@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cinttypes>
 #include <cmath>
@@ -503,6 +504,16 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+// The registers in register_table.inc, a bit each (RegisterFile::GetRegisterInfo
+// is too slow for every register write).
+static constexpr auto kKnownRegisters = [] {
+  std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> bits{};
+#define XE_GPU_REGISTER(index, type, name) bits[(index) >> 6] |= uint64_t(1) << ((index) & 63);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return bits;
+}();
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -518,7 +529,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!(kKnownRegisters[index >> 6] & (uint64_t(1) << (index & 63)))) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -1138,6 +1149,11 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && count > 1) {
+    // Consecutive registers: the backend handles constant ranges at once.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;

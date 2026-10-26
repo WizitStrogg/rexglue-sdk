@@ -386,8 +386,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  // Reused, as this is called for most draws.
+  thread_local std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  merged_ranges.clear();
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -405,10 +406,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 
   SCOPE_profile_cpu_f("gpu");
 
-  std::sort(merged_ranges.begin(), merged_ranges.end(),
-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
-              return a.first < b.first;
-            });
+  if (merged_ranges.size() > 1) {
+    std::sort(merged_ranges.begin(), merged_ranges.end(),
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                return a.first < b.first;
+              });
+  }
   size_t merged_write = 0;
   for (size_t i = 1; i < merged_ranges.size(); ++i) {
     std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
