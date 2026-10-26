@@ -24,7 +24,7 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_upload_prefetch, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(shared_memory_upload_prefetch, true, "GPU/D3D12",
                     "When guest memory has to be uploaded for the GPU, also upload the pages the "
                     "GPU used in the previous frame that the CPU has changed since, in the same "
                     "batch, so the following draws don't each need a batch of their own (each "
