@@ -154,6 +154,16 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   return true;
 }
 
+uintptr_t GetModuleBaseOfAddress(const void* address) {
+  HMODULE module = nullptr;
+  if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                      reinterpret_cast<LPCWSTR>(address), &module)) {
+    return 0;
+  }
+  return reinterpret_cast<uintptr_t>(module);
+}
+
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   access_out = PageAccess::kNoAccess;
 

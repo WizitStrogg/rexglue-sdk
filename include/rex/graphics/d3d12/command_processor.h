@@ -85,6 +85,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+  // Appends the parts of [start, start + length) holding memexport results that
+  // aren't in guest memory yet (being read back lazily, or written since the
+  // last readback, per readback_memexport_keep_unread), as sorted and merged
+  // [start, end) pairs.
+  // Guest memory there is older than the GPU's data, so it must not be
+  // uploaded over it. Command processor thread, locks the global critical
+  // region.
+  void GetUnreadMemexportRanges(uint32_t start, uint32_t length,
+                                std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const;
+
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
   // done after the latest ExecuteCommandLists + Signal.
@@ -231,6 +241,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t PrepareAsyncGuestVisibleWrite() override;
   bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
   void PrepareForWait() override;
+  void PrepareGuestMemoryReadByGpu(uint32_t physical_address, uint32_t length) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -392,6 +403,25 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Reads back the memexport destinations deferred since the last guest-visible
   // write, waiting for the GPU once for all of them.
   void FlushDeferredMemexportReadback();
+  // readback_memexport_lazy: submits the copy of the deferred memexport
+  // destinations and read-watches their pages instead of waiting. Returns the
+  // submission of the copy, or 0 if none was needed or it was done
+  // synchronously.
+  uint64_t IssueLazyMemexportReadback();
+  // Copies the lazy readbacks completed by the submission to guest memory in
+  // order, and removes the read watches from the pages no pending readback
+  // covers. The global critical region must be locked.
+  void ApplyCompletedLazyReadbacks(uint64_t completed_submission);
+  bool IsPageInPendingLazyReadback(uint32_t page) const;
+  // The newest pending lazy readback overlapping the range, or 0.
+  uint64_t GetLazyReadbackSubmission(uint32_t physical_address, uint32_t length) const;
+  // Command processor thread: makes the guest memory in the range current.
+  void AwaitLazyReadbacks(uint32_t physical_address, uint32_t length);
+  // The data provider for the read-watched pages, on whichever thread accesses
+  // them, with the global critical region locked.
+  static void LazyReadbackDataProviderThunk(void* context, uint32_t physical_address,
+                                            uint32_t length);
+  void ProvideLazyReadbackData(uint32_t physical_address, uint32_t length);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
@@ -846,6 +876,23 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool in_use = false;
   };
   std::vector<AsyncReadbackBuffer> async_readback_buffers_;
+  // readback_memexport_lazy: memexport results being copied back, oldest
+  // first. The guest pages they cover are inaccessible to the guest until the
+  // copy is in guest memory, so guest-visible writes are done right away, and
+  // the guest CPU only waits for the GPU if it touches those pages early.
+  // Protected by the global critical region (the data provider runs on
+  // whichever thread touches the pages), except that only the command
+  // processor adds buffers, so it may read their immutable fields unlocked.
+  struct LazyReadback {
+    uint64_t submission;
+    size_t buffer_index;
+    std::vector<draw_util::MemExportRange> ranges;
+  };
+  std::deque<LazyReadback> lazy_readbacks_;
+  std::vector<AsyncReadbackBuffer> lazy_readback_buffers_;
+  std::vector<std::pair<uint32_t, uint32_t>> lazy_readback_applied_ranges_;
+  // Size of lazy_readbacks_, readable without the lock.
+  std::atomic<uint32_t> lazy_readback_count_{0};
 };
 
 }  // namespace rex::graphics::d3d12

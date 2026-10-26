@@ -114,6 +114,10 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+// Base address of the loaded module (executable or library) containing the
+// address, or 0 if unknown. For diagnostics.
+uintptr_t GetModuleBaseOfAddress(const void* address);
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>

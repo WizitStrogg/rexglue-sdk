@@ -17,11 +17,23 @@
 
 namespace rex::graphics::diag {
 
+// Batches of guest memory uploads (each a pair of shared memory barriers), and
+// the bytes uploaded.
+inline std::atomic<uint64_t> upload_batches{0};
+inline std::atomic<uint64_t> upload_bytes{0};
 // Pages holding GPU-written (memexport/resolve) data that the CPU wrote to.
 inline std::atomic<uint64_t> cpu_writes_to_gpu_pages{0};
 // Pages uploaded by merging only the dwords the CPU changed.
 inline std::atomic<uint64_t> merged_page_uploads{0};
 inline std::atomic<uint64_t> merged_dwords{0};
+// Uploads that kept the GPU's data where a pending lazy readback is still to
+// overwrite stale guest memory, and the bytes kept.
+inline std::atomic<uint64_t> uploads_keeping_readback_data{0};
+inline std::atomic<uint64_t> upload_bytes_kept_for_readback{0};
+// Uploads over memexport results written since the last readback (kept or
+// not, per readback_memexport_keep_unread), and the bytes.
+inline std::atomic<uint64_t> uploads_over_unread_memexport{0};
+inline std::atomic<uint64_t> upload_bytes_over_unread_memexport{0};
 // Draws with memory export, and the bytes they export (known ranges only).
 inline std::atomic<uint64_t> memexport_draws{0};
 inline std::atomic<uint64_t> memexport_bytes{0};
@@ -46,12 +58,49 @@ enum class GpuCategory : uint32_t {
   kCount,
 };
 inline std::atomic<uint64_t> gpu_category_us[size_t(GpuCategory::kCount)];
+// readback_memexport_lazy: copies issued, guest accesses to pages still being
+// copied back, those that had to wait for the GPU and the time they waited,
+// and command processor reads of such memory.
+inline std::atomic<uint64_t> lazy_readbacks{0};
+inline std::atomic<uint64_t> lazy_page_accesses{0};
+inline std::atomic<uint64_t> lazy_page_access_waits{0};
+inline std::atomic<uint64_t> lazy_page_access_wait_us{0};
+inline std::atomic<uint64_t> lazy_gpu_reads{0};
 // Command processor time spent waiting for the GPU, in microseconds.
 inline std::atomic<uint64_t> cp_gpu_wait_us{0};
 // Time the submission thread spent replaying and submitting command lists, and
 // time the command processor spent waiting for it.
 inline std::atomic<uint64_t> submission_thread_us{0};
 inline std::atomic<uint64_t> submission_thread_flush_us{0};
+// Frame limiter: time spent waiting for the next frame's slot and the frames
+// that waited, frames that came in late but kept the schedule, and frames so
+// late that the schedule restarted.
+inline std::atomic<uint64_t> frame_limiter_wait_us{0};
+inline std::atomic<uint64_t> frame_limiter_waits{0};
+inline std::atomic<uint64_t> frame_limiter_late_frames{0};
+inline std::atomic<uint64_t> frame_limiter_resets{0};
+// Command processor time with no guest commands to execute, in microseconds.
+inline std::atomic<uint64_t> cp_idle_us{0};
+// Guest frames (swap to swap) longer than 20, 33 and 50 ms, and the longest.
+inline std::atomic<uint64_t> frames_over_20ms{0};
+inline std::atomic<uint64_t> frames_over_33ms{0};
+inline std::atomic<uint64_t> frames_over_50ms{0};
+inline std::atomic<uint64_t> longest_frame_us{0};
+inline void RecordFrameTime(uint64_t frame_us) {
+  if (frame_us > 20000) {
+    frames_over_20ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (frame_us > 33333) {
+    frames_over_33ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (frame_us > 50000) {
+    frames_over_50ms.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint64_t longest = longest_frame_us.load(std::memory_order_relaxed);
+  while (frame_us > longest &&
+         !longest_frame_us.compare_exchange_weak(longest, frame_us, std::memory_order_relaxed)) {
+  }
+}
 
 // Render target ownership transfers (EDRAM data copied between host render
 // targets): count and EDRAM tiles, by source and destination render target
@@ -146,15 +195,24 @@ inline std::string TakeTransferSummary() {
 
 inline std::string TakeSummary() {
   return fmt::format(
-      "memexport {} draws / {} KB, readback {} KB, CPU writes to GPU-written pages {}, merged "
-      "uploads {} pages / {} dwords, {} submissions, GPU busy {} ms, command processor GPU "
+      "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB, CPU writes to "
+      "GPU-written pages {}, merged uploads {} pages / {} dwords, uploads keeping pending "
+      "readback data {} ({} KB), uploads over unread memexport results {} ({} KB), {} "
+      "submissions, GPU busy {} ms, command processor GPU "
       "waits {} ms (of the GPU time: render target transfers {} ms, texture loads {} ms, "
       "resolves {} ms, memory uploads {} ms; transfers: host depth store {} ms, barriers {} ms, "
       "draws {} ms, stencil clears {} ms, stencil bit draws {} ms), submission thread {} ms "
-      "(command processor waited {} ms for it)",
+      "(command processor waited {} ms for it), lazy readbacks {}, guest accesses to pages "
+      "being read back {} ({} waited, {} ms), command processor reads of them {}, frame "
+      "limiter waited {} ms in {} frames ({} late, {} resets), command processor idle {} ms, "
+      "frames over 20/33/50 ms {}/{}/{}, longest {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
-      readback_bytes.exchange(0) >> 10, cpu_writes_to_gpu_pages.exchange(0),
-      merged_page_uploads.exchange(0), merged_dwords.exchange(0), submissions.exchange(0),
+      readback_bytes.exchange(0) >> 10, upload_batches.exchange(0), upload_bytes.exchange(0) >> 10,
+      cpu_writes_to_gpu_pages.exchange(0),
+      merged_page_uploads.exchange(0), merged_dwords.exchange(0),
+      uploads_keeping_readback_data.exchange(0), upload_bytes_kept_for_readback.exchange(0) >> 10,
+      uploads_over_unread_memexport.exchange(0), upload_bytes_over_unread_memexport.exchange(0) >> 10,
+      submissions.exchange(0),
       gpu_busy_us.exchange(0) / 1000, cp_gpu_wait_us.exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kRenderTargetTransfers)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kTextureLoads)].exchange(0) / 1000,
@@ -165,7 +223,13 @@ inline std::string TakeSummary() {
       gpu_category_us[size_t(GpuCategory::kTransferDraws)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kTransferStencilClears)].exchange(0) / 1000,
       gpu_category_us[size_t(GpuCategory::kTransferStencilDraws)].exchange(0) / 1000,
-      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000) +
+      submission_thread_us.exchange(0) / 1000, submission_thread_flush_us.exchange(0) / 1000,
+      lazy_readbacks.exchange(0), lazy_page_accesses.exchange(0), lazy_page_access_waits.exchange(0),
+      lazy_page_access_wait_us.exchange(0) / 1000, lazy_gpu_reads.exchange(0),
+      frame_limiter_wait_us.exchange(0) / 1000, frame_limiter_waits.exchange(0),
+      frame_limiter_late_frames.exchange(0), frame_limiter_resets.exchange(0),
+      cp_idle_us.exchange(0) / 1000, frames_over_20ms.exchange(0), frames_over_33ms.exchange(0),
+      frames_over_50ms.exchange(0), longest_frame_us.exchange(0) / 1000) +
          "; " + TakeTransferSummary();
 }
 

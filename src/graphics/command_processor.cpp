@@ -389,6 +389,11 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      diag::cp_idle_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - idle_start)
+                       .count()),
+          std::memory_order_relaxed);
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -1009,6 +1014,7 @@ bool CommandProcessor::TryExecutePacketType3Async(memory::RingBuffer* reader, ui
       uint32_t value;
       if (wait_info & 0x10) {
         // The memory as the GPU sees it, with the queued writes done.
+        PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
         value = GpuSwap(LoadMemoryForGpu(poll_reg_addr & ~uint32_t(0x3)),
                         static_cast<xenos::Endian>(poll_reg_addr & 0x3));
       } else {
@@ -1401,6 +1407,17 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   // The small guest FPS readout also works in Release, where the full
   // profiling macros compile out. Shared runtime counters feed the F3 UI.
+  {
+    // Command processor thread only.
+    static GuestFrameMeter::Clock::time_point last_swap_time{};
+    auto swap_time = GuestFrameMeter::Clock::now();
+    if (last_swap_time.time_since_epoch().count()) {
+      diag::RecordFrameTime(uint64_t(
+          std::chrono::duration_cast<std::chrono::microseconds>(swap_time - last_swap_time)
+              .count()));
+    }
+    last_swap_time = swap_time;
+  }
   auto mean_us = guest_frame_meter_.Record(GuestFrameMeter::Clock::now());
   rex::perf::SetCounter(rex::perf::CounterId::kFrameTimeUs, mean_us);
   rex::perf::SetCounter(rex::perf::CounterId::kFps, mean_us > 0 ? 1000000 / mean_us : 0);
@@ -1463,6 +1480,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
+      PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFC, 4);
       // With async_guest_writes_wait_lookup, writes queued asynchronously
       // earlier in the command stream are treated as already done, as they
       // are from the GPU's point of view.
@@ -1642,6 +1660,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    PrepareGuestMemoryReadByGpu(poll_reg_addr & 0x1FFFFFFF, 4);
     value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {

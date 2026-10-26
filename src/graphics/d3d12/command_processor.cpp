@@ -56,6 +56,47 @@ REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
                     "processor and the GPU working in parallel.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy, false, "GPU/D3D12",
+                    "With readback_memexport_deferred, do fence writes and interrupts right "
+                    "away, and make the memory the memexport results are being copied back to "
+                    "inaccessible to the guest CPU until the copy has completed. The CPU then "
+                    "waits for the GPU only if it touches that memory before the copy is done. "
+                    "Overrides readback_memexport_async.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(readback_memexport_keep_unread, 2, "GPU/D3D12",
+                     "Memexport results not in guest memory yet, where uploads of guest memory "
+                     "keep the GPU's data, as guest memory there is older (otherwise, a CPU write "
+                     "elsewhere in the page makes the upload replace them with stale data): 0 - "
+                     "none, 1 - those being read back lazily, 2 - also those written since the "
+                     "last readback")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_watch, true, "GPU/D3D12",
+                    "With readback_memexport_lazy, make the guest pages of the copies still in "
+                    "flight inaccessible to the guest CPU. Diagnostic: without it, the guest CPU "
+                    "may read stale data")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_await, false, "GPU/D3D12",
+                    "Diagnostic for readback_memexport_lazy: wait for each copy right after "
+                    "submitting it and put the data in guest memory, before the fence write or "
+                    "interrupt, like readback_memexport_deferred without readback_memexport_async")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_await_on_wait, false, "GPU/D3D12",
+                    "Diagnostic for readback_memexport_lazy: when the command processor waits "
+                    "(out of commands, or WAIT_REG_MEM), first wait for the copies in flight and "
+                    "put their data in guest memory, as readback_memexport_async does")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy_delay_writes, false, "GPU/D3D12",
+                    "Diagnostic for readback_memexport_lazy: delay fence writes and interrupts "
+                    "until the copy submitted before them has completed, as "
+                    "readback_memexport_async does")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submission_thread, false, "GPU/D3D12",
                     "Replay and submit command lists on a separate thread, so the graphics "
                     "driver's work runs in parallel with command processing")
@@ -1664,12 +1705,19 @@ bool D3D12CommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  memory_->SetPhysicalMemoryDataProvider(LazyReadbackDataProviderThunk, this);
+
   return true;
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
   FlushSubmissionThread();
   AwaitAllQueueOperationsCompletion();
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    ApplyCompletedLazyReadbacks(UINT64_MAX);
+    memory_->SetPhysicalMemoryDataProvider(nullptr, nullptr);
+  }
   if (submission_thread_.joinable()) {
     {
       std::lock_guard<std::mutex> lock(submission_mutex_);
@@ -1688,6 +1736,11 @@ void D3D12CommandProcessor::ShutdownContext() {
     readback.buffer->Release();
   }
   async_readback_buffers_.clear();
+  for (AsyncReadbackBuffer& readback : lazy_readback_buffers_) {
+    readback.buffer->Unmap(0, nullptr);
+    readback.buffer->Release();
+  }
+  lazy_readback_buffers_.clear();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
   ShutdownTimestampResources();
@@ -1957,6 +2010,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+
+  if (render_target_cache_) {
+    render_target_cache_->OnSwapForFrameLog();
+  }
 
   if (!graphics_system_)
     return;
@@ -2839,15 +2896,314 @@ void D3D12CommandProcessor::FlushDeferredMemexportReadback() {
   memexport_readback_deferred_size_ = 0;
 }
 
-void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() { FlushDeferredMemexportReadback(); }
+void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() {
+  if (REXCVAR_GET(readback_memexport_lazy)) {
+    IssueLazyMemexportReadback();
+  } else {
+    FlushDeferredMemexportReadback();
+  }
+}
 
 void D3D12CommandProcessor::PrepareForWait() {
   // The asynchronous writes are older than the deferred ranges.
   CommandProcessor::PrepareForWait();
-  FlushDeferredMemexportReadback();
+  OnBeforeGuestVisibleWrite();
+  if (REXCVAR_GET(readback_memexport_lazy_await_on_wait) &&
+      lazy_readback_count_.load(std::memory_order_relaxed)) {
+    uint64_t newest_submission = 0;
+    {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (!lazy_readbacks_.empty()) {
+        newest_submission = lazy_readbacks_.back().submission;
+      }
+    }
+    if (newest_submission) {
+      // Applies them.
+      CheckSubmissionFence(newest_submission);
+    }
+  }
+}
+
+void D3D12CommandProcessor::PrepareGuestMemoryReadByGpu(uint32_t physical_address,
+                                                        uint32_t length) {
+  AwaitLazyReadbacks(physical_address, length);
+}
+
+uint64_t D3D12CommandProcessor::IssueLazyMemexportReadback() {
+  if (memexport_readback_deferred_ranges_.empty()) {
+    return 0;
+  }
+  uint32_t total_size = memexport_readback_deferred_size_;
+  if (!BeginSubmission(false)) {
+    FlushDeferredMemexportReadback();
+    return 0;
+  }
+
+  size_t buffer_index = SIZE_MAX;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (size_t i = 0; i < lazy_readback_buffers_.size(); ++i) {
+      const AsyncReadbackBuffer& buffer = lazy_readback_buffers_[i];
+      if (!buffer.in_use && buffer.size >= total_size &&
+          (buffer_index == SIZE_MAX || buffer.size < lazy_readback_buffers_[buffer_index].size)) {
+        buffer_index = i;
+      }
+    }
+    if (buffer_index != SIZE_MAX) {
+      lazy_readback_buffers_[buffer_index].in_use = true;
+    }
+  }
+  if (buffer_index == SIZE_MAX) {
+    uint32_t size = std::bit_ceil(std::max(uint32_t(1) << 16, total_size));
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* buffer;
+    if (FAILED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      FlushDeferredMemexportReadback();
+      return 0;
+    }
+    D3D12_RANGE read_range = {0, size};
+    void* mapping;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      buffer->Release();
+      FlushDeferredMemexportReadback();
+      return 0;
+    }
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    lazy_readback_buffers_.push_back({buffer, mapping, size, true});
+    buffer_index = lazy_readback_buffers_.size() - 1;
+  }
+  diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
+  diag::lazy_readbacks.fetch_add(1, std::memory_order_relaxed);
+
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
+  ID3D12Resource* readback_buffer = lazy_readback_buffers_[buffer_index].buffer;
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_readback_deferred_ranges_) {
+    deferred_command_list_.D3DCopyBufferRegion(readback_buffer, readback_offset,
+                                               shared_memory_buffer,
+                                               memexport_range.base_address_dwords << 2,
+                                               memexport_range.size_bytes);
+    readback_offset += memexport_range.size_bytes;
+  }
+
+  // Submitted before the pages are watched, so whoever touches them only waits
+  // for the GPU, never for the command processor.
+  uint64_t submission = submission_current_;
+  EndSubmission(false);
+
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    lazy_readbacks_.push_back(
+        {submission, buffer_index, std::move(memexport_readback_deferred_ranges_)});
+    lazy_readback_count_.fetch_add(1, std::memory_order_relaxed);
+    if (REXCVAR_GET(readback_memexport_lazy_watch)) {
+      for (const draw_util::MemExportRange& memexport_range : lazy_readbacks_.back().ranges) {
+        memory_->EnablePhysicalMemoryReadWatches(memexport_range.base_address_dwords << 2,
+                                                 memexport_range.size_bytes);
+      }
+    }
+  }
+  memexport_readback_deferred_ranges_.clear();
+  memexport_readback_deferred_size_ = 0;
+
+  if (REXCVAR_GET(readback_memexport_lazy_await)) {
+    // Applies it.
+    CheckSubmissionFence(submission);
+  }
+  return submission;
+}
+
+bool D3D12CommandProcessor::IsPageInPendingLazyReadback(uint32_t page) const {
+  const uint32_t page_size_log2 = 12;
+  for (const LazyReadback& readback : lazy_readbacks_) {
+    for (const draw_util::MemExportRange& range : readback.ranges) {
+      uint32_t start = range.base_address_dwords << 2;
+      if (page >= (start >> page_size_log2) &&
+          page <= ((start + range.size_bytes - 1) >> page_size_log2)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void D3D12CommandProcessor::GetUnreadMemexportRanges(
+    uint32_t start, uint32_t length,
+    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) const {
+  if (!length) {
+    return;
+  }
+  size_t first_new = ranges_out.size();
+  uint32_t end = start + length;
+  // Returns the size of the overlap.
+  auto append = [&](const draw_util::MemExportRange& range, bool keep) -> uint32_t {
+    uint32_t range_start = std::max(start, range.base_address_dwords << 2);
+    uint32_t range_end = std::min(end, (range.base_address_dwords << 2) + range.size_bytes);
+    if (range_start >= range_end) {
+      return 0;
+    }
+    if (keep) {
+      ranges_out.emplace_back(range_start, range_end);
+    }
+    return range_end - range_start;
+  };
+  int32_t keep_unread = REXCVAR_GET(readback_memexport_keep_unread);
+  if (!memexport_readback_deferred_ranges_.empty()) {
+    // Written since the last readback, still only in the GPU's copy.
+    bool keep = keep_unread >= 2;
+    uint32_t unread_bytes = 0;
+    for (const draw_util::MemExportRange& range : memexport_readback_deferred_ranges_) {
+      unread_bytes += append(range, keep);
+    }
+    if (unread_bytes) {
+      diag::uploads_over_unread_memexport.fetch_add(1, std::memory_order_relaxed);
+      diag::upload_bytes_over_unread_memexport.fetch_add(unread_bytes, std::memory_order_relaxed);
+    }
+  }
+  if (keep_unread >= 1 && lazy_readback_count_.load(std::memory_order_relaxed)) {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    for (const LazyReadback& readback : lazy_readbacks_) {
+      for (const draw_util::MemExportRange& range : readback.ranges) {
+        append(range, true);
+      }
+    }
+  }
+  if (ranges_out.size() - first_new < 2) {
+    return;
+  }
+  std::sort(ranges_out.begin() + first_new, ranges_out.end());
+  size_t merged_last = first_new;
+  for (size_t i = first_new + 1; i < ranges_out.size(); ++i) {
+    if (ranges_out[i].first <= ranges_out[merged_last].second) {
+      ranges_out[merged_last].second =
+          std::max(ranges_out[merged_last].second, ranges_out[i].second);
+    } else {
+      ranges_out[++merged_last] = ranges_out[i];
+    }
+  }
+  ranges_out.resize(merged_last + 1);
+}
+
+uint64_t D3D12CommandProcessor::GetLazyReadbackSubmission(uint32_t physical_address,
+                                                          uint32_t length) const {
+  uint64_t submission = 0;
+  uint32_t end = physical_address + length;
+  for (const LazyReadback& readback : lazy_readbacks_) {
+    for (const draw_util::MemExportRange& range : readback.ranges) {
+      uint32_t start = range.base_address_dwords << 2;
+      if (start < end && physical_address < start + range.size_bytes) {
+        submission = std::max(submission, readback.submission);
+        break;
+      }
+    }
+  }
+  return submission;
+}
+
+void D3D12CommandProcessor::ApplyCompletedLazyReadbacks(uint64_t completed_submission) {
+  if (lazy_readbacks_.empty() || lazy_readbacks_.front().submission > completed_submission) {
+    return;
+  }
+  lazy_readback_applied_ranges_.clear();
+  while (!lazy_readbacks_.empty() && lazy_readbacks_.front().submission <= completed_submission) {
+    LazyReadback& readback = lazy_readbacks_.front();
+    AsyncReadbackBuffer& buffer = lazy_readback_buffers_[readback.buffer_index];
+    const uint8_t* readback_bytes = static_cast<const uint8_t*>(buffer.mapping);
+    for (const draw_util::MemExportRange& range : readback.ranges) {
+      uint32_t address = range.base_address_dwords << 2;
+      std::memcpy(memory_->TranslatePhysical(address), readback_bytes, range.size_bytes);
+      readback_bytes += range.size_bytes;
+      lazy_readback_applied_ranges_.emplace_back(address, range.size_bytes);
+    }
+    buffer.in_use = false;
+    lazy_readbacks_.pop_front();
+    lazy_readback_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+  // Pages that newer pending readbacks also cover stay watched.
+  const uint32_t page_size_log2 = 12;
+  for (const auto& [address, size] : lazy_readback_applied_ranges_) {
+    uint32_t page_first = address >> page_size_log2;
+    uint32_t page_last = (address + size - 1) >> page_size_log2;
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t page = page_first; page <= page_last + 1; ++page) {
+      if (page <= page_last && !IsPageInPendingLazyReadback(page)) {
+        if (run_first == UINT32_MAX) {
+          run_first = page;
+        }
+      } else if (run_first != UINT32_MAX) {
+        memory_->DisablePhysicalMemoryReadWatches(run_first << page_size_log2,
+                                                  (page - run_first) << page_size_log2);
+        run_first = UINT32_MAX;
+      }
+    }
+  }
+}
+
+void D3D12CommandProcessor::AwaitLazyReadbacks(uint32_t physical_address, uint32_t length) {
+  if (!lazy_readback_count_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  uint64_t submission;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    submission = GetLazyReadbackSubmission(physical_address, length);
+  }
+  if (!submission) {
+    return;
+  }
+  diag::lazy_gpu_reads.fetch_add(1, std::memory_order_relaxed);
+  // Applies the completed readbacks.
+  CheckSubmissionFence(submission);
+}
+
+void D3D12CommandProcessor::LazyReadbackDataProviderThunk(void* context,
+                                                          uint32_t physical_address,
+                                                          uint32_t length) {
+  static_cast<D3D12CommandProcessor*>(context)->ProvideLazyReadbackData(physical_address, length);
+}
+
+void D3D12CommandProcessor::ProvideLazyReadbackData(uint32_t physical_address, uint32_t length) {
+  // Any thread, with the global critical region locked.
+  diag::lazy_page_accesses.fetch_add(1, std::memory_order_relaxed);
+  bool waited = false;
+  const auto wait_start = std::chrono::steady_clock::now();
+  while (uint64_t submission = GetLazyReadbackSubmission(physical_address, length)) {
+    uint64_t completed = submission_fence_->GetCompletedValue();
+    if (completed < submission) {
+      // The copy has been submitted, so this only waits for the GPU. Let the
+      // command processor go on meanwhile (unless this thread had the lock
+      // already, then it waits).
+      waited = true;
+      std::recursive_mutex& global_mutex = rex::thread::global_critical_region::mutex();
+      global_mutex.unlock();
+      submission_fence_->SetEventOnCompletion(submission, nullptr);
+      global_mutex.lock();
+      completed = submission_fence_->GetCompletedValue();
+    }
+    ApplyCompletedLazyReadbacks(completed);
+  }
+  if (waited) {
+    diag::lazy_page_access_waits.fetch_add(1, std::memory_order_relaxed);
+    diag::lazy_page_access_wait_us.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - wait_start)
+                     .count()),
+        std::memory_order_relaxed);
+  }
 }
 
 uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
+  if (REXCVAR_GET(readback_memexport_lazy)) {
+    // Issued here too, as the write may be queued behind older ones.
+    uint64_t submission = IssueLazyMemexportReadback();
+    return REXCVAR_GET(readback_memexport_lazy_delay_writes) ? submission : 0;
+  }
   if (memexport_readback_deferred_ranges_.empty() || !REXCVAR_GET(readback_memexport_async) ||
       !submission_open_) {
     return 0;
@@ -3305,6 +3661,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
+    // Older memexport results must not overwrite this later.
+    AwaitLazyReadbacks(written_address, written_length);
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
@@ -3427,6 +3785,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   }
   if (submission_completed_ < await_submission) {
     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
+  }
+  if (lazy_readback_count_.load(std::memory_order_relaxed)) {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    ApplyCompletedLazyReadbacks(submission_completed_);
   }
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
