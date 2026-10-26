@@ -3018,7 +3018,7 @@ void D3D12CommandProcessor::StopLazyApplyThread() {
 }
 
 void D3D12CommandProcessor::LazyApplyThreadMain() {
-  rex::thread::set_current_thread_name("Lazy memexport readback apply");
+  SetThreadDescription(GetCurrentThread(), L"Lazy memexport readback apply");
   while (true) {
     {
       std::unique_lock<std::mutex> lock(lazy_apply_mutex_);
