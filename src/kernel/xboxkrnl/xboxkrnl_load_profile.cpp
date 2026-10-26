@@ -872,6 +872,7 @@ void ReporterMain() {
         continue;
       }
       Row row;
+      row.host_tid = tid;
       row.label = fmt::format("host {}", tid);
       auto host_it = host.find(tid);
       if (host_it != host.end() && !host_it->second.name.empty()) {
