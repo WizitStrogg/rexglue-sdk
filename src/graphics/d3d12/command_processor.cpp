@@ -56,7 +56,7 @@ REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
                     "processor and the GPU working in parallel.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_memexport_lazy, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(readback_memexport_lazy, false, "GPU/D3D12",
                     "With readback_memexport_deferred, do fence writes and interrupts right "
                     "away, and make the memory the memexport results are being copied back to "
                     "inaccessible to the guest CPU until the copy has completed. The CPU then "
