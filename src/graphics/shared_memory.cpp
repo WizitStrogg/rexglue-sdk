@@ -599,6 +599,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   FireWatches(page_first, page_last, false);
 
+  diag::cpu_invalidations.fetch_add(1, std::memory_order_relaxed);
+  diag::cpu_invalidated_pages.fetch_add(page_last - page_first + 1, std::memory_order_relaxed);
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
 }

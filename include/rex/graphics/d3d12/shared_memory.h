@@ -90,6 +90,9 @@ class D3D12SharedMemory : public SharedMemory {
   std::vector<ID3D12Heap*> buffer_tiled_heaps_;
   // Pending lazy memexport readback ranges within the pages being uploaded.
   std::vector<std::pair<uint32_t, uint32_t>> upload_kept_ranges_;
+  // Diagnostics: pages uploaded in the guest frame uploaded_in_frame_index_.
+  std::vector<uint64_t> uploaded_in_frame_;
+  uint64_t uploaded_in_frame_index_ = 0;
   D3D12_RESOURCE_STATES buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
   bool buffer_uav_writes_commit_needed_ = false;
   void CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES new_state);

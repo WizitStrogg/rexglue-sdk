@@ -21,6 +21,37 @@ namespace rex::graphics::diag {
 // the bytes uploaded.
 inline std::atomic<uint64_t> upload_batches{0};
 inline std::atomic<uint64_t> upload_bytes{0};
+// What the uploads are for, set around the shared memory requests.
+enum class UploadReason : uint32_t {
+  kVertices,
+  kIndices,
+  kMemexport,
+  kTextures,
+  kResolves,
+  kOther,
+  kCount,
+};
+inline thread_local UploadReason upload_reason = UploadReason::kOther;
+inline std::array<std::atomic<uint64_t>, size_t(UploadReason::kCount)> upload_batches_by_reason{};
+inline std::array<std::atomic<uint64_t>, size_t(UploadReason::kCount)> upload_bytes_by_reason{};
+class ScopedUploadReason {
+ public:
+  explicit ScopedUploadReason(UploadReason reason) : previous_(upload_reason) {
+    upload_reason = reason;
+  }
+  ~ScopedUploadReason() { upload_reason = previous_; }
+  ScopedUploadReason(const ScopedUploadReason&) = delete;
+  ScopedUploadReason& operator=(const ScopedUploadReason&) = delete;
+
+ private:
+  UploadReason previous_;
+};
+// Pages uploaded again in the same guest frame.
+inline std::atomic<uint64_t> pages_reuploaded_in_frame{0};
+// Invalidations of shared memory by CPU writes (and other guest memory
+// changes), and the pages invalidated (with the expansion around them).
+inline std::atomic<uint64_t> cpu_invalidations{0};
+inline std::atomic<uint64_t> cpu_invalidated_pages{0};
 // Pages holding GPU-written (memexport/resolve) data that the CPU wrote to.
 inline std::atomic<uint64_t> cpu_writes_to_gpu_pages{0};
 // Pages uploaded by merging only the dwords the CPU changed.
@@ -193,9 +224,20 @@ inline std::string TakeTransferSummary() {
   return result;
 }
 
+inline std::string TakeUploadReasonSummary() {
+  std::string summary;
+  for (size_t i = 0; i < size_t(UploadReason::kCount); ++i) {
+    summary += fmt::format("{}{}/{} KB", i ? " " : "", upload_batches_by_reason[i].exchange(0),
+                           upload_bytes_by_reason[i].exchange(0) >> 10);
+  }
+  return summary;
+}
+
 inline std::string TakeSummary() {
   return fmt::format(
-      "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB, CPU writes to "
+      "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB (by reason, "
+      "vertices/indices/memexport/textures/resolves/other: {}; pages uploaded again in the "
+      "frame {}), CPU write invalidations {} ({} pages), CPU writes to "
       "GPU-written pages {}, merged uploads {} pages / {} dwords, uploads keeping pending "
       "readback data {} ({} KB), uploads over unread memexport results {} ({} KB), {} "
       "submissions, GPU busy {} ms, command processor GPU "
@@ -208,6 +250,8 @@ inline std::string TakeSummary() {
       "frames over 20/33/50 ms {}/{}/{}, longest {} ms",
       memexport_draws.exchange(0), memexport_bytes.exchange(0) >> 10,
       readback_bytes.exchange(0) >> 10, upload_batches.exchange(0), upload_bytes.exchange(0) >> 10,
+      TakeUploadReasonSummary(), pages_reuploaded_in_frame.exchange(0),
+      cpu_invalidations.exchange(0), cpu_invalidated_pages.exchange(0),
       cpu_writes_to_gpu_pages.exchange(0),
       merged_page_uploads.exchange(0), merged_dwords.exchange(0),
       uploads_keeping_readback_data.exchange(0), upload_bytes_kept_for_readback.exchange(0) >> 10,
