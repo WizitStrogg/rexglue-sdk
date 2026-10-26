@@ -54,6 +54,19 @@ REXCVAR_DEFINE_BOOL(diag_load_profile_sample, false, "Kernel",
                     "next to the exe for names.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(diag_load_profile_sample_host, false, "Kernel",
+                    "Diagnostic: with diag_load_profile_sample, also sample the busiest host "
+                    "threads (GPU commands, audio, ...), unwinding their stacks, and log the "
+                    "hottest functions, the functions they're spent in (inclusive) and call "
+                    "chains every diag_load_profile_sample_host_s seconds ([load-prof-host] "
+                    "lines). Uses the PDBs next to the exe and the DLLs for names.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(diag_load_profile_sample_host_s, 5, "Kernel",
+                     "Seconds of samples in each diag_load_profile_sample_host report.")
+    .range(1, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(load_timer, false, "Kernel",
                     "Diagnostic: time loads and log [load-timer] lines (also runs while "
                     "faster_loading is on). A load is a stretch of heavy disk reading "
@@ -272,6 +285,21 @@ std::vector<uint32_t> g_sample_targets;
 std::unordered_map<uint32_t, SampleBuckets> g_sample_buckets;
 std::atomic<bool> g_sampler_started{false};
 
+// diag_load_profile_sample_host: busy host threads, sampled with their stacks
+// unwound, and reported every diag_load_profile_sample_host_s seconds.
+struct HostSampleBuckets {
+  uint64_t samples = 0;
+  std::unordered_map<uint64_t, uint32_t> leaf;
+  // The innermost frame inside the exe, rexruntime or rexgpu-xenos.
+  std::unordered_map<uint64_t, uint32_t> own_frame;
+  // Functions (start addresses) anywhere on the stack, once per sample.
+  std::unordered_map<uint64_t, uint32_t> inclusive;
+  // Innermost frames (up to 8) as raw bytes.
+  std::unordered_map<std::string, uint32_t> chain;
+};
+std::vector<uint32_t> g_host_sample_targets;
+std::unordered_map<uint32_t, HostSampleBuckets> g_host_sample_buckets;
+
 #ifdef _WIN32
 uintptr_t g_exe_begin = 0;
 uintptr_t g_exe_end = 0;
@@ -284,10 +312,182 @@ void InitExeRange() {
   g_exe_end = base + nt->OptionalHeader.SizeOfImage;
 }
 
+// The exe and the runtime's own DLLs (the GPU one is loaded as a plugin).
+struct ModuleRange {
+  uintptr_t begin = 0;
+  uintptr_t end = 0;
+};
+ModuleRange g_own_modules[3];
+
+void InitOwnModuleRanges() {
+  const wchar_t* names[] = {nullptr, L"rexruntime.dll", L"rexgpu-xenos.dll"};
+  for (size_t i = 0; i < 3; ++i) {
+    HMODULE module = GetModuleHandleW(names[i]);
+    if (!module) {
+      continue;
+    }
+    auto base = reinterpret_cast<uintptr_t>(module);
+    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    g_own_modules[i].begin = base;
+    g_own_modules[i].end = base + nt->OptionalHeader.SizeOfImage;
+  }
+}
+
+bool InOwnModule(uint64_t address) {
+  for (const ModuleRange& range : g_own_modules) {
+    if (address >= range.begin && address < range.end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A host thread's stack, copied while it's suspended and unwound afterwards
+// (unwinding takes locks, so not while the thread may hold them).
+constexpr size_t kHostStackCopyBytes = 64 * 1024;
+constexpr size_t kHostMaxFrames = 32;
+
+struct HostStackSample {
+  CONTEXT context;
+  size_t stack_bytes = 0;
+  uint64_t frames[kHostMaxFrames];
+  uint64_t functions[kHostMaxFrames];
+  size_t frame_count = 0;
+};
+
+// Must not allocate or take locks: the thread is suspended.
+bool CaptureSuspendedHostStack(HANDLE thread, HostStackSample& sample, uint8_t* stack_copy) {
+  std::memset(&sample.context, 0, sizeof(sample.context));
+  sample.context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  if (!GetThreadContext(thread, &sample.context)) {
+    return false;
+  }
+  sample.stack_bytes = 0;
+  MEMORY_BASIC_INFORMATION info;
+  if (VirtualQuery(reinterpret_cast<const void*>(sample.context.Rsp), &info, sizeof(info)) &&
+      info.State == MEM_COMMIT && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+    uint64_t region_end = uint64_t(reinterpret_cast<uintptr_t>(info.BaseAddress)) + info.RegionSize;
+    sample.stack_bytes =
+        size_t(std::min<uint64_t>(region_end - sample.context.Rsp, kHostStackCopyBytes)) &
+        ~size_t(7);
+    std::memcpy(stack_copy, reinterpret_cast<const void*>(sample.context.Rsp),
+                sample.stack_bytes);
+  }
+  return true;
+}
+
+// Unwinding a frame of a wrong return address can read anywhere.
+bool VirtualUnwindStep(DWORD64 image_base, PRUNTIME_FUNCTION function, CONTEXT* context) {
+  __try {
+    void* handler_data = nullptr;
+    DWORD64 establisher_frame = 0;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+                     &handler_data, &establisher_frame, nullptr);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {  // NOLINT
+    return false;
+  }
+}
+
+// Unwinds the copy. stack_copy is 2 * kHostStackCopyBytes so that a frame
+// crossing the end of the copied part only reads zeros.
+void UnwindHostStack(HostStackSample& sample, uint8_t* stack_copy) {
+  const uint64_t original_low = sample.context.Rsp;
+  const uint64_t original_high = original_low + sample.stack_bytes;
+  const uint64_t copy_low = uint64_t(reinterpret_cast<uintptr_t>(stack_copy));
+  std::memset(stack_copy + sample.stack_bytes, 0, 2 * kHostStackCopyBytes - sample.stack_bytes);
+  auto rewrite = [&](DWORD64& value) {
+    if (value >= original_low && value < original_high) {
+      value = value - original_low + copy_low;
+    }
+  };
+  auto* words = reinterpret_cast<DWORD64*>(stack_copy);
+  for (size_t i = 0; i < sample.stack_bytes / sizeof(DWORD64); ++i) {
+    rewrite(words[i]);
+  }
+  CONTEXT& context = sample.context;
+  for (DWORD64* reg : {&context.Rbx, &context.Rbp, &context.Rsi, &context.Rdi, &context.R12,
+                       &context.R13, &context.R14, &context.R15}) {
+    rewrite(*reg);
+  }
+  context.Rsp = copy_low;
+  const uint64_t copy_high = copy_low + sample.stack_bytes;
+  sample.frame_count = 0;
+  while (sample.frame_count < kHostMaxFrames && context.Rip) {
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+    sample.frames[sample.frame_count] = context.Rip;
+    sample.functions[sample.frame_count] =
+        function ? image_base + function->BeginAddress : context.Rip;
+    ++sample.frame_count;
+    if (context.Rsp < copy_low || context.Rsp + sizeof(DWORD64) > copy_high) {
+      break;
+    }
+    if (function) {
+      if (!VirtualUnwindStep(image_base, function, &context)) {
+        break;
+      }
+    } else {
+      // Leaf function: the return address is on top of the stack.
+      context.Rip = *reinterpret_cast<const DWORD64*>(uintptr_t(context.Rsp));
+      context.Rsp += sizeof(DWORD64);
+    }
+    if (context.Rsp < copy_low || context.Rsp > copy_high) {
+      break;
+    }
+  }
+}
+
+void SampleHostThread(HANDLE thread, uint32_t tid, uint8_t* stack_copy) {
+  static HostStackSample sample;
+  if (SuspendThread(thread) == DWORD(-1)) {
+    return;
+  }
+  bool captured = CaptureSuspendedHostStack(thread, sample, stack_copy);
+  ResumeThread(thread);
+  if (!captured) {
+    return;
+  }
+  uint64_t leaf = sample.context.Rip;
+  UnwindHostStack(sample, stack_copy);
+  uint64_t own_frame = 0;
+  for (size_t i = 0; i < sample.frame_count; ++i) {
+    if (InOwnModule(sample.frames[i])) {
+      own_frame = sample.frames[i];
+      break;
+    }
+  }
+  std::string chain_key;
+  for (size_t i = 0; i < sample.frame_count && i < 8; ++i) {
+    chain_key.append(reinterpret_cast<const char*>(&sample.frames[i]), sizeof(uint64_t));
+  }
+  std::lock_guard<std::mutex> lock(g_sample_mutex);
+  HostSampleBuckets& buckets = g_host_sample_buckets[tid];
+  ++buckets.samples;
+  ++buckets.leaf[leaf];
+  if (own_frame) {
+    ++buckets.own_frame[own_frame];
+  }
+  for (size_t i = 0; i < sample.frame_count; ++i) {
+    bool seen = false;
+    for (size_t j = 0; j < i; ++j) {
+      seen |= sample.functions[j] == sample.functions[i];
+    }
+    if (!seen) {
+      ++buckets.inclusive[sample.functions[i]];
+    }
+  }
+  if (!chain_key.empty()) {
+    ++buckets.chain[chain_key];
+  }
+}
+
 void SamplerMain() {
   InitExeRange();
   std::unordered_map<uint32_t, HANDLE> handles;
   uint64_t stack[1024];
+  std::vector<uint8_t> host_stack_copy(2 * kHostStackCopyBytes);
   for (;;) {
     if (!REXCVAR_GET(diag_load_profile) || !REXCVAR_GET(diag_load_profile_sample)) {
       Sleep(100);
@@ -295,9 +495,22 @@ void SamplerMain() {
     }
     Sleep(2);
     std::vector<uint32_t> targets;
+    std::vector<uint32_t> host_targets;
     {
       std::lock_guard<std::mutex> lock(g_sample_mutex);
       targets = g_sample_targets;
+      host_targets = g_host_sample_targets;
+    }
+    for (uint32_t tid : host_targets) {
+      auto handle_it = handles.find(tid);
+      if (handle_it == handles.end()) {
+        HANDLE opened = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+        handle_it = handles.emplace(tid, opened).first;
+      }
+      if (handle_it->second) {
+        SampleHostThread(handle_it->second, tid, host_stack_copy.data());
+      }
     }
     for (uint32_t tid : targets) {
       auto handle_it = handles.find(tid);
@@ -449,7 +662,8 @@ void SamplerMain() {}
 std::string Symbolize(uint64_t address) { return fmt::format("{:#x}", address); }
 #endif
 
-std::string TopFunctions(const std::unordered_map<uint64_t, uint32_t>& counts, uint64_t total) {
+std::string TopFunctions(const std::unordered_map<uint64_t, uint32_t>& counts, uint64_t total,
+                         size_t max_shown = 8) {
   std::unordered_map<std::string, uint32_t> by_name;
   for (const auto& [address, count] : counts) {
     by_name[Symbolize(address)] += count;
@@ -458,7 +672,7 @@ std::string TopFunctions(const std::unordered_map<uint64_t, uint32_t>& counts, u
   std::sort(sorted.begin(), sorted.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
   std::string text;
-  for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+  for (size_t i = 0; i < sorted.size() && i < max_shown; ++i) {
     text += fmt::format("{}{} {:.0f}%", i ? ", " : "", sorted[i].first,
                         total ? 100.0 * sorted[i].second / double(total) : 0.0);
   }
@@ -472,6 +686,107 @@ struct Row {
   double cpu_pct = 0.0;
   Snapshot delta;
 };
+
+// diag_load_profile_sample_host: picks the host threads to sample and logs
+// what was sampled every diag_load_profile_sample_host_s seconds.
+void ReportHostSamples(const std::vector<Row>& rows,
+                       const std::unordered_map<uint32_t, HostThreadCpu>& host) {
+#ifdef _WIN32
+  static auto last_report = std::chrono::steady_clock::now();
+  static std::unordered_map<uint32_t, double> cpu_pct_sum;
+  static uint32_t seconds = 0;
+  if (!REXCVAR_GET(diag_load_profile_sample_host)) {
+    std::lock_guard<std::mutex> lock(g_sample_mutex);
+    g_host_sample_targets.clear();
+    g_host_sample_buckets.clear();
+    cpu_pct_sum.clear();
+    seconds = 0;
+    last_report = std::chrono::steady_clock::now();
+    return;
+  }
+  ++seconds;
+  for (const Row& row : rows) {
+    if (!row.guest) {
+      cpu_pct_sum[row.host_tid] += row.cpu_pct;
+    }
+  }
+  auto now = std::chrono::steady_clock::now();
+  bool report = now - last_report >=
+                std::chrono::seconds(REXCVAR_GET(diag_load_profile_sample_host_s));
+  std::unordered_map<uint32_t, HostSampleBuckets> buckets;
+  {
+    std::lock_guard<std::mutex> lock(g_sample_mutex);
+    if (g_host_sample_targets.empty()) {
+      InitOwnModuleRanges();
+    }
+    // The (up to) 2 busiest host threads; kept while they stay busy so that a
+    // report covers the whole period.
+    g_host_sample_targets.clear();
+    for (const Row& row : rows) {
+      if (!row.guest && row.cpu_pct >= 30.0 && g_host_sample_targets.size() < 2) {
+        g_host_sample_targets.push_back(row.host_tid);
+      }
+    }
+    if (report) {
+      buckets.swap(g_host_sample_buckets);
+    }
+  }
+  if (!report) {
+    return;
+  }
+  double elapsed_s = std::chrono::duration<double>(now - last_report).count();
+  last_report = now;
+  for (const auto& [tid, sampled] : buckets) {
+    if (!sampled.samples) {
+      continue;
+    }
+    std::string label = fmt::format("host {}", tid);
+    auto host_it = host.find(tid);
+    if (host_it != host.end() && !host_it->second.name.empty()) {
+      label += " '" + host_it->second.name + "'";
+    }
+    auto cpu_it = cpu_pct_sum.find(tid);
+    double cpu_pct = cpu_it != cpu_pct_sum.end() && seconds ? cpu_it->second / seconds : 0.0;
+    REXKRNL_WARN(
+        "[load-prof-host] {} cpu {:.0f}% ({} samples in {:.1f} s) | at: {} | in own code: {} | "
+        "inclusive: {}",
+        label, cpu_pct, sampled.samples, elapsed_s, TopFunctions(sampled.leaf, sampled.samples),
+        TopFunctions(sampled.own_frame, sampled.samples),
+        TopFunctions(sampled.inclusive, sampled.samples, 30));
+    std::unordered_map<std::string, uint32_t> by_text;
+    for (const auto& [key, count] : sampled.chain) {
+      std::string text;
+      std::string previous_name;
+      size_t shown = 0;
+      for (size_t offset = 0; offset + sizeof(uint64_t) <= key.size() && shown < 8;
+           offset += sizeof(uint64_t)) {
+        uint64_t address = 0;
+        std::memcpy(&address, key.data() + offset, sizeof(address));
+        std::string name = Symbolize(address);
+        if (name == previous_name) {
+          continue;
+        }
+        text += (shown ? " < " : "") + name;
+        previous_name = name;
+        ++shown;
+      }
+      by_text[text] += count;
+    }
+    std::vector<std::pair<std::string, uint32_t>> chains(by_text.begin(), by_text.end());
+    std::sort(chains.begin(), chains.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string chain_line;
+    for (size_t i = 0; i < chains.size() && i < 8; ++i) {
+      chain_line += fmt::format("{}{:.1f}%: {}", i ? " ;; " : "",
+                                100.0 * chains[i].second / double(sampled.samples),
+                                chains[i].first);
+    }
+    REXKRNL_WARN("[load-prof-host-chain] {} | {}", label, chain_line);
+  }
+  cpu_pct_sum.clear();
+  seconds = 0;
+#endif
+}
 
 void ReporterMain() {
   std::unordered_map<const ThreadStats*, Snapshot> previous;
@@ -633,6 +948,7 @@ void ReporterMain() {
     for (const Row& row : rows) {
       labels[row.host_tid] = row.label;
     }
+    ReportHostSamples(rows, host);
     for (const auto& [tid, sampled] : buckets) {
       if (!sampled.samples) {
         continue;
