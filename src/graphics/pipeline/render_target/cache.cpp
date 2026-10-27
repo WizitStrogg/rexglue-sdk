@@ -57,6 +57,14 @@ REXCVAR_DEFINE_BOOL(skip_redundant_render_target_transfers, true, "GPU",
                     "1x and 4x MSAA with only depth testing in one of them)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(render_target_transfer_skip_overwritten, false, "GPU",
+                    "With host render targets, leave out of the transfers to a draw's render "
+                    "targets the pixels the draw overwrites in all of them: one rectangle with "
+                    "depth and stencil always passing and replaced, and color written without "
+                    "blending, such as the clears Direct3D 9 on the Xbox 360 does by drawing a "
+                    "rectangle with 4x MSAA. Direct3D 12 only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(render_target_frame_log, 0, "GPU",
                      "Diagnostic: when changed to a value N above 0, log the render target "
                      "bindings, ownership transfers and resolves of the next N frames (up to 8) "
@@ -478,6 +486,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
 
+  bool pixel_shader_known = update_pixel_shader_known_;
+  update_pixel_shader_known_ = false;
+  last_update_transfer_cutout_valid_ = false;
+
   if (frame_log_frames_remaining_) {
     ++frame_log_draw_;
     ++frame_log_draws_since_line_;
@@ -763,11 +775,22 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  // The draw's own writes replace the previous contents where it overwrites
+  // everything, so there's no need to transfer them there.
+  if (!interlock_barrier_only && pixel_shader_known &&
+      REXCVAR_GET(render_target_transfer_skip_overwritten) &&
+      GetDrawOverwriteRectangle(normalized_depth_control, depth_and_color_rts_used_bits,
+                                vertex_shader, update_pixel_shader_,
+                                last_update_transfer_cutout_)) {
+    last_update_transfer_cutout_valid_ = true;
+  }
+
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
+                    last_update_transfer_cutout());
   }
 
   if (interlock_barrier_only) {
@@ -918,6 +941,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                               transfer.stencil_unchanged ? " depth only" : "");
         }
       }
+      if (last_update_transfer_cutout_valid_) {
+        line += fmt::format(" | overwrites {},{} {}x{} px", last_update_transfer_cutout_.x_pixels,
+                            last_update_transfer_cutout_.y_pixels,
+                            last_update_transfer_cutout_.width_pixels,
+                            last_update_transfer_cutout_.height_pixels);
+      }
       REXGPU_INFO("{}", line);
       frame_log_last_keys_ = keys;
       frame_log_draws_since_line_ = 0;
@@ -987,6 +1016,120 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     are_accumulated_render_targets_valid_ = true;
   }
 
+  return true;
+}
+
+bool RenderTargetCache::GetDrawOverwriteRectangle(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                  uint32_t depth_and_color_rts_used_bits,
+                                                  const Shader& vertex_shader,
+                                                  const Shader* pixel_shader,
+                                                  Transfer::Rectangle& rectangle_out) {
+  const RegisterFile& regs = register_file();
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      vgt_draw_initiator.num_indices != 3) {
+    return false;
+  }
+  auto reject = [](diag::OverwriteReject reason) {
+    diag::overwrite_rejects[size_t(reason)].fetch_add(1, std::memory_order_relaxed);
+    return false;
+  };
+
+  // Every sample of the covered pixels is written.
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back ||
+      pa_su_sc_mode_cntl.poly_mode == xenos::PolygonModeEnable::kDualMode ||
+      (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xF) != 0xF) {
+    return reject(diag::OverwriteReject::kRasterizer);
+  }
+  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+  if ((pixel_shader && pixel_shader->kills_pixels()) ||
+      (rb_colorcontrol.alpha_test_enable &&
+       rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
+      rb_colorcontrol.alpha_to_mask_enable) {
+    return reject(diag::OverwriteReject::kPixelShader);
+  }
+
+  // Depth and stencil are both replaced.
+  if (depth_and_color_rts_used_bits & 1) {
+    if (!normalized_depth_control.z_enable || !normalized_depth_control.z_write_enable ||
+        normalized_depth_control.zfunc != xenos::CompareFunction::kAlways) {
+      return reject(diag::OverwriteReject::kDepth);
+    }
+    // With depth always passing, only the pass operation is done.
+    auto face_overwrites_stencil = [](xenos::CompareFunction func, xenos::StencilOp zpass,
+                                      reg::RB_STENCILREFMASK ref_mask) {
+      return func == xenos::CompareFunction::kAlways &&
+             (zpass == xenos::StencilOp::kReplace || zpass == xenos::StencilOp::kZero) &&
+             ref_mask.stencilwritemask == 0xFF;
+    };
+    if (!normalized_depth_control.stencil_enable ||
+        !face_overwrites_stencil(normalized_depth_control.stencilfunc,
+                                 normalized_depth_control.stencilzpass,
+                                 regs.Get<reg::RB_STENCILREFMASK>()) ||
+        (normalized_depth_control.backface_enable &&
+         !face_overwrites_stencil(
+             normalized_depth_control.stencilfunc_bf, normalized_depth_control.stencilzpass_bf,
+             regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)))) {
+      return reject(diag::OverwriteReject::kStencil);
+    }
+  }
+
+  // All components of the color render targets are written without blending.
+  uint32_t rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!(depth_and_color_rts_used_bits & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
+    uint32_t format_component_mask =
+        (uint32_t(1) << xenos::GetColorRenderTargetFormatComponentCount(
+             regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i])
+                 .color_format)) -
+        1;
+    auto blendcontrol =
+        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (((rb_color_mask >> (4 * i)) & format_component_mask) != format_component_mask ||
+        blendcontrol.color_srcblend != xenos::BlendFactor::kOne ||
+        blendcontrol.color_destblend != xenos::BlendFactor::kZero ||
+        blendcontrol.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blendcontrol.alpha_srcblend != xenos::BlendFactor::kOne ||
+        blendcontrol.alpha_destblend != xenos::BlendFactor::kZero ||
+        blendcontrol.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      return reject(diag::OverwriteReject::kColor);
+    }
+  }
+
+  float left, top, right, bottom;
+  if (!draw_extent_estimator_.GetRectangle(vertex_shader, left, top, right, bottom)) {
+    return reject(diag::OverwriteReject::kVertices);
+  }
+  // Only pixels entirely inside, and not the outermost ones of those either:
+  // with resolution scaling, the host may draw the rectangle up to half a host
+  // pixel away.
+  auto to_pixel = [](float coordinate, bool round_up) {
+    coordinate = std::min(std::max(coordinate, -16384.0f), 16384.0f);
+    return int32_t(round_up ? std::ceil(coordinate) : std::floor(coordinate));
+  };
+  int32_t x0 = to_pixel(left, true) + 1;
+  int32_t y0 = to_pixel(top, true) + 1;
+  int32_t x1 = to_pixel(right, false) - 1;
+  int32_t y1 = to_pixel(bottom, false) - 1;
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  x0 = std::max(x0, int32_t(scissor.offset[0]));
+  y0 = std::max(y0, int32_t(scissor.offset[1]));
+  x1 = std::min(x1, int32_t(scissor.offset[0] + scissor.extent[0]));
+  y1 = std::min(y1, int32_t(scissor.offset[1] + scissor.extent[1]));
+  x0 = std::max(x0, int32_t(0));
+  y0 = std::max(y0, int32_t(0));
+  if (x1 <= x0 || y1 <= y0) {
+    return reject(diag::OverwriteReject::kEmpty);
+  }
+  rectangle_out.x_pixels = uint32_t(x0);
+  rectangle_out.y_pixels = uint32_t(y0);
+  rectangle_out.width_pixels = uint32_t(x1 - x0);
+  rectangle_out.height_pixels = uint32_t(y1 - y0);
+  diag::overwrite_draws.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -1660,10 +1803,12 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
             diag::RecordTransfer(transfer_source.key, dest.key, transfer_end_tiles - it->first);
           }
           if (transfer_redundant) {
-          } else if (!resolve_clear_cutout ||
-              Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
-                                           dest_pitch_tiles, dest.msaa_samples, dest_is_64bpp,
-                                           nullptr, resolve_clear_cutout)) {
+          } else if (resolve_clear_cutout &&
+                     !Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest.base_tiles,
+                                                   dest_pitch_tiles, dest.msaa_samples,
+                                                   dest_is_64bpp, nullptr, resolve_clear_cutout)) {
+            diag::cutout_transfers_skipped.fetch_add(1, std::memory_order_relaxed);
+          } else {
             RenderTargetKey transfer_host_depth_source =
                 host_depth_encoding_different
                     ? it->second.GetHostDepthRenderTarget(dest.GetDepthFormat())

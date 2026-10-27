@@ -243,6 +243,23 @@ inline void RecordStencilTransferBits(uint32_t bits, uint32_t tiles) {
 }
 // EDRAM tiles of transfers back to a render target still holding the data.
 inline std::atomic<uint64_t> redundant_transfer_tiles{0};
+// render_target_transfer_skip_overwritten: draws found to overwrite a
+// rectangle in all of their render targets, transfers left out entirely by a
+// cutout (also resolve clears), and single-rectangle draws found not to
+// overwrite by the first reason.
+enum class OverwriteReject : uint32_t {
+  kRasterizer,
+  kPixelShader,
+  kDepth,
+  kStencil,
+  kColor,
+  kVertices,
+  kEmpty,
+  kCount,
+};
+inline std::atomic<uint64_t> overwrite_draws{0};
+inline std::atomic<uint64_t> cutout_transfers_skipped{0};
+inline std::atomic<uint64_t> overwrite_rejects[size_t(OverwriteReject::kCount)];
 inline std::string TakeTransferSummary() {
   std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> entries(transfer_stats.begin(),
                                                                           transfer_stats.end());
@@ -275,6 +292,13 @@ inline std::string TakeTransferSummary() {
     for (size_t i = 0; i < std::min(bits_tiles.size(), size_t(8)); ++i) {
       result += fmt::format(" {:02X}:{}", bits_tiles[i].second, bits_tiles[i].first);
     }
+  }
+  result += fmt::format(
+      "; overwriting draws {}, transfers left out by cutouts {}, single-rectangle draws not "
+      "overwriting by reason (rasterizer/pixel shader/depth/stencil/color/vertices/empty)",
+      overwrite_draws.exchange(0), cutout_transfers_skipped.exchange(0));
+  for (size_t i = 0; i < size_t(OverwriteReject::kCount); ++i) {
+    result += fmt::format("{}{}", i ? "/" : " ", overwrite_rejects[i].exchange(0));
   }
   result += "; ";
   result +=

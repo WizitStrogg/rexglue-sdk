@@ -646,7 +646,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // be null / empty in case there's nothing to do for them.
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
-  // bound checks.
+  // bound checks. Without clear values, it's only left out of the transfers
+  // (the area a draw overwrites).
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,

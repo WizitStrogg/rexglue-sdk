@@ -2524,6 +2524,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
   GpuProfileScope transfers_profile_scope = BeginGpuProfileScope();
+  render_target_cache_->SetUpdatePixelShader(pixel_shader);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
