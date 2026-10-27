@@ -2929,8 +2929,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else if (!memexport_readback_deferred_ranges_.empty()) {
     ++draws_since_memexport_;
     int32_t eager_draws = REXCVAR_GET(readback_memexport_eager_draws);
+    // The readback ends the submission, which would cut an occlusion query
+    // short, so it waits for the query to end.
     if (eager_draws > 0 && draws_since_memexport_ >= uint32_t(eager_draws) &&
-        !REXCVAR_GET(readback_memexport_lazy) && PrepareAsyncGuestVisibleWrite()) {
+        !REXCVAR_GET(readback_memexport_lazy) && !active_occlusion_query_.valid &&
+        !scratch_buffer_used_ && PrepareAsyncGuestVisibleWrite()) {
       diag::eager_readbacks.fetch_add(1, std::memory_order_relaxed);
     }
   }
