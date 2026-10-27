@@ -333,6 +333,7 @@ bool DrawExtentEstimator::GetRectangle(const Shader& vertex_shader, float& left_
   }
 
   float vertices[3][2];
+  float vertices_w_reciprocal = 0.0f;
   shader_interpreter_.SetShader(vertex_shader);
   PositionYExportSink position_export_sink;
   shader_interpreter_.SetExportSink(&position_export_sink);
@@ -365,16 +366,27 @@ bool DrawExtentEstimator::GetRectangle(const Shader& vertex_shader, float& left_
       vertices_known = false;
       break;
     }
+    if (!position_export_sink.position_w().has_value()) {
+      vertices_known = false;
+      break;
+    }
+    // Without vtx_w0_fmt, the exported W is already 1/W.
+    float w = position_export_sink.position_w().value();
+    float w_reciprocal = pa_cl_vte_cntl.vtx_w0_fmt ? 1.0f / w : w;
+    // The host builds the fourth corner in clip space, so it is the corner of
+    // the rectangle only if W is the same for all vertices. Positive W also
+    // keeps the rectangle in front of the clipping W = 0 plane.
+    if (!(w_reciprocal > 0.0f) || !std::isfinite(w_reciprocal) ||
+        (i && w_reciprocal != vertices_w_reciprocal)) {
+      vertices_known = false;
+      break;
+    }
+    vertices_w_reciprocal = w_reciprocal;
     float position[2] = {position_export_sink.position_x().value(),
                          position_export_sink.position_y().value()};
     if (!pa_cl_vte_cntl.vtx_xy_fmt) {
-      if (!position_export_sink.position_w().has_value()) {
-        vertices_known = false;
-        break;
-      }
-      float w = position_export_sink.position_w().value();
-      position[0] /= w;
-      position[1] /= w;
+      position[0] *= w_reciprocal;
+      position[1] *= w_reciprocal;
     }
     for (uint32_t j = 0; j < 2; ++j) {
       vertices[i][j] = position[j] * viewport_scale[j] + viewport_offset[j];
