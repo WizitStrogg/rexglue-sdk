@@ -57,3 +57,8 @@ std::vector<HostedSession> HostedSessions();
 uint32_t JoinedHostIp();
 
 }  // namespace rex::kernel::xam::session
+
+// 1 while the game's gameplay session is ending: from XSessionEnd until that
+// session's XSessionDelete, or the next XSessionCreate or XSessionStart; else 0.
+// Any thread.
+extern "C" int rex_session_ending();
