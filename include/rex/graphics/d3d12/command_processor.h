@@ -487,6 +487,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   HANDLE fence_completion_event_ = nullptr;
 
   bool submission_open_ = false;
+  // For d3d12_submission_interval_draws.
+  uint32_t draws_in_submission_ = 0;
   // Values of submission_fence_.
   uint64_t submission_current_ = 1;
   uint64_t submission_completed_ = 0;

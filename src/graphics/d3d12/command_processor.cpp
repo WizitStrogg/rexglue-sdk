@@ -115,6 +115,14 @@ REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
                     "driver's work runs in parallel with command processing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(d3d12_submission_interval_draws, 0, "GPU/D3D12",
+                     "Also end the submission after this many draws, so the GPU starts on a "
+                     "long stretch of draws while the command processor is still recording "
+                     "it, instead of when a memexport readback or the frame ends it, and is "
+                     "less behind when the command processor next waits for it (0 = off)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamps, false, "GPU/D3D12",
                     "Measure the host GPU time of each submission with timestamp queries "
                     "(for the performance diagnostics log)");
@@ -2895,6 +2903,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // Otherwise the GPU only gets the draws when a memexport readback or the
+  // frame ends the submission, and a long stretch without either leaves it idle
+  // while the command processor records, then far behind when the command
+  // processor next waits for it (once a frame, for the swap interrupt).
+  int32_t submission_interval_draws = REXCVAR_GET(d3d12_submission_interval_draws);
+  if (submission_interval_draws > 0 &&
+      ++draws_in_submission_ >= uint32_t(submission_interval_draws)) {
+    // Memexport results waiting for their readback must be copied in this
+    // submission (PrepareAsyncGuestVisibleWrite needs it open), and an
+    // occlusion query would be cut short.
+    if (memexport_readback_deferred_ranges_.empty() && !active_occlusion_query_.valid &&
+        !scratch_buffer_used_) {
+      if (EndSubmission(false)) {
+        diag::interval_submissions.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (draws_in_submission_ == uint32_t(submission_interval_draws)) {
+      diag::interval_submissions_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   return true;
 }
 
@@ -3452,6 +3480,8 @@ bool D3D12CommandProcessor::MemexportReadbackFullPath(
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
+  diag::sync_readbacks.fetch_add(1, std::memory_order_relaxed);
+  diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kReadback);
   if (!AwaitAllQueueOperationsCompletion()) {
     return true;
   }
@@ -3922,11 +3952,12 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       PROFILE_CMD_BUFFER_STALL();
       const auto wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
-      diag::cp_gpu_wait_us.fetch_add(
-          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                       std::chrono::steady_clock::now() - wait_start)
-                       .count()),
-          std::memory_order_relaxed);
+      uint64_t wait_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - wait_start)
+                                      .count());
+      diag::cp_gpu_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+      diag::cp_gpu_wait_us_by_reason[size_t(diag::cp_gpu_wait)].fetch_add(
+          wait_us, std::memory_order_relaxed);
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -4072,8 +4103,12 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
+  {
+    diag::ScopedCpGpuWait gpu_wait_reason(is_opening_frame ? diag::CpGpuWait::kFrameQueue
+                                                           : diag::cp_gpu_wait);
+    CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
+                                          : 0);
+  }
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -4092,6 +4127,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    draws_in_submission_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
