@@ -52,6 +52,10 @@ inline std::atomic<uint64_t> pages_reuploaded_in_frame{0};
 // uploaded along with a batch before being requested, and the batches.
 inline std::atomic<uint64_t> prefetched_pages{0};
 inline std::atomic<uint64_t> prefetch_batches{0};
+// Prefetched pages the GPU didn't use in the rest of the frame, and batches
+// that prefetched shared_memory_upload_prefetch_max_kb.
+inline std::atomic<uint64_t> prefetched_pages_unused{0};
+inline std::atomic<uint64_t> prefetch_batches_full{0};
 // Invalidations of shared memory by CPU writes (and other guest memory
 // changes), and the pages invalidated (with the expansion around them).
 inline std::atomic<uint64_t> cpu_invalidations{0};
@@ -119,6 +123,51 @@ inline std::array<std::atomic<uint64_t>, size_t(CpMemoryRead::kCount)>
 inline std::atomic<uint64_t> lazy_readbacks_applied_by_thread{0};
 // Command processor time spent waiting for the GPU, in microseconds.
 inline std::atomic<uint64_t> cp_gpu_wait_us{0};
+// What the command processor was doing when it waited for the GPU, set around
+// the callers.
+enum class CpGpuWait : uint32_t {
+  // Before a WAIT_REG_MEM, for the queued guest-visible writes.
+  kWaitRegMem,
+  // Out of commands, for the queued guest-visible writes.
+  kIdle,
+  // Before a REG_TO_MEM or COND_WRITE, for the queued guest-visible writes.
+  kRegToMem,
+  // Memexport results read back synchronously.
+  kReadback,
+  // Opening a frame with kQueueFrames frames already in flight.
+  kFrameQueue,
+  kOther,
+  kCount,
+};
+inline thread_local CpGpuWait cp_gpu_wait = CpGpuWait::kOther;
+inline std::array<std::atomic<uint64_t>, size_t(CpGpuWait::kCount)> cp_gpu_wait_us_by_reason{};
+class ScopedCpGpuWait {
+ public:
+  explicit ScopedCpGpuWait(CpGpuWait reason) : previous_(cp_gpu_wait) { cp_gpu_wait = reason; }
+  ~ScopedCpGpuWait() { cp_gpu_wait = previous_; }
+  ScopedCpGpuWait(const ScopedCpGpuWait&) = delete;
+  ScopedCpGpuWait& operator=(const ScopedCpGpuWait&) = delete;
+
+ private:
+  CpGpuWait previous_;
+};
+// d3d12_submission_interval_draws: submissions ended for the interval, and
+// draws that reached it but couldn't end the submission yet.
+inline std::atomic<uint64_t> interval_submissions{0};
+inline std::atomic<uint64_t> interval_submissions_deferred{0};
+// Memexport results read back with the command processor waiting for the GPU.
+inline std::atomic<uint64_t> sync_readbacks{0};
+// readback_memexport_async: readbacks, those issued after
+// readback_memexport_eager_draws draws, and the draws without memexport between
+// the last memexport draw and each readback (GPU work the guest-visible writes
+// queued behind the readback also wait for).
+inline std::atomic<uint64_t> async_readbacks{0};
+inline std::atomic<uint64_t> eager_readbacks{0};
+inline std::atomic<uint64_t> draws_after_memexport_at_readback{0};
+// d3d12_prefetch_at_wait: pages uploaded before a WAIT_REG_MEM, and the command
+// processor time it took.
+inline std::atomic<uint64_t> wait_prefetched_pages{0};
+inline std::atomic<uint64_t> wait_prefetch_us{0};
 // Time the submission thread spent replaying and submitting command lists, and
 // time the command processor spent waiting for it.
 inline std::atomic<uint64_t> submission_thread_us{0};
@@ -265,6 +314,27 @@ inline std::string TakeLazyCpReadSummary() {
   return summary;
 }
 
+inline std::string TakeCpGpuWaitSummary() {
+  std::string summary =
+      "command processor GPU waits by cause (WAIT_REG_MEM/idle/REG_TO_MEM/readback/frame "
+      "queue/other) ";
+  for (size_t i = 0; i < size_t(CpGpuWait::kCount); ++i) {
+    summary += fmt::format("{}{}", i ? "/" : "", cp_gpu_wait_us_by_reason[i].exchange(0) / 1000);
+  }
+  summary += fmt::format(" ms, synchronous readbacks {}, interval submissions {} ({} deferred)",
+                         sync_readbacks.exchange(0), interval_submissions.exchange(0),
+                         interval_submissions_deferred.exchange(0));
+  summary +=
+      fmt::format(", asynchronous readbacks {} ({} eager) after {} draws without memexport in all",
+                  async_readbacks.exchange(0), eager_readbacks.exchange(0),
+                  draws_after_memexport_at_readback.exchange(0));
+  summary += fmt::format(", prefetched before waits {} pages in {} ms",
+                         wait_prefetched_pages.exchange(0), wait_prefetch_us.exchange(0) / 1000);
+  summary += fmt::format(", prefetched pages unused in their frame {}, full prefetch batches {}",
+                         prefetched_pages_unused.exchange(0), prefetch_batches_full.exchange(0));
+  return summary;
+}
+
 inline std::string TakeSummary() {
   return fmt::format(
       "memexport {} draws / {} KB, readback {} KB, uploads {} batches / {} KB (by reason, "
@@ -309,7 +379,7 @@ inline std::string TakeSummary() {
       frame_limiter_late_frames.exchange(0), frame_limiter_resets.exchange(0),
       cp_idle_us.exchange(0) / 1000, frames_over_20ms.exchange(0), frames_over_33ms.exchange(0),
       frames_over_50ms.exchange(0), longest_frame_us.exchange(0) / 1000) +
-         "; " + TakeTransferSummary();
+         "; " + TakeTransferSummary() + "; " + TakeCpGpuWaitSummary();
 }
 
 }  // namespace rex::graphics::diag

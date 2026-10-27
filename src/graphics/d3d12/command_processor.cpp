@@ -56,6 +56,15 @@ REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
                     "processor and the GPU working in parallel.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(readback_memexport_eager_draws, 0, "GPU/D3D12",
+                     "With readback_memexport_async, read the memexport results back once this "
+                     "many draws without memexport have followed the last one, instead of at the "
+                     "next fence write, interrupt or wait, so the fence writes and interrupts "
+                     "queued behind the readback don't also wait for the GPU to do those later "
+                     "draws (0 = off)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport_lazy, false, "GPU/D3D12",
                     "With readback_memexport_deferred, do fence writes and interrupts right "
                     "away, and make the memory the memexport results are being copied back to "
@@ -113,6 +122,22 @@ REXCVAR_DEFINE_BOOL(readback_memexport_lazy_apply_thread, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
                     "Replay and submit command lists on a separate thread, so the graphics "
                     "driver's work runs in parallel with command processing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(d3d12_submission_interval_draws, 0, "GPU/D3D12",
+                     "Also end the submission after this many draws, so the GPU starts on a "
+                     "long stretch of draws while the command processor is still recording "
+                     "it, instead of when a memexport readback or the frame ends it, and is "
+                     "less behind when the command processor next waits for it (0 = off)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_prefetch_at_wait, false, "GPU/D3D12",
+                    "With shared_memory_upload_prefetch, before a WAIT_REG_MEM the command "
+                    "processor may sleep in (once a frame, waiting for the GPU), upload the "
+                    "guest memory the GPU used in the frame that the CPU has changed since, "
+                    "which the first upload of the next frame would otherwise do while the GPU "
+                    "has nothing to work on")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamps, false, "GPU/D3D12",
@@ -2895,6 +2920,44 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // The fence writes and interrupts after memexport are queued behind its
+  // readback, which otherwise is only issued at the first of them, so they also
+  // wait for the GPU to do all the draws in between (the swap interrupt, which
+  // the command processor waits for once a frame, too).
+  if (memexport_used) {
+    draws_since_memexport_ = 0;
+  } else if (!memexport_readback_deferred_ranges_.empty()) {
+    ++draws_since_memexport_;
+    int32_t eager_draws = REXCVAR_GET(readback_memexport_eager_draws);
+    // The readback ends the submission, which would cut an occlusion query
+    // short, so it waits for the query to end.
+    if (eager_draws > 0 && draws_since_memexport_ >= uint32_t(eager_draws) &&
+        !REXCVAR_GET(readback_memexport_lazy) && !active_occlusion_query_.valid &&
+        !scratch_buffer_used_ && PrepareAsyncGuestVisibleWrite()) {
+      diag::eager_readbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Otherwise the GPU only gets the draws when a memexport readback or the
+  // frame ends the submission, and a long stretch without either leaves it idle
+  // while the command processor records, then far behind when the command
+  // processor next waits for it (once a frame, for the swap interrupt).
+  int32_t submission_interval_draws = REXCVAR_GET(d3d12_submission_interval_draws);
+  if (submission_interval_draws > 0 && submission_open_ &&
+      ++draws_in_submission_ >= uint32_t(submission_interval_draws)) {
+    // Memexport results waiting for their readback must be copied in this
+    // submission (PrepareAsyncGuestVisibleWrite needs it open), and an
+    // occlusion query would be cut short.
+    if (memexport_readback_deferred_ranges_.empty() && !active_occlusion_query_.valid &&
+        !scratch_buffer_used_) {
+      if (EndSubmission(false)) {
+        diag::interval_submissions.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (draws_in_submission_ == uint32_t(submission_interval_draws)) {
+      diag::interval_submissions_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   return true;
 }
 
@@ -2917,6 +2980,28 @@ void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() {
     IssueLazyMemexportReadback();
   } else {
     FlushDeferredMemexportReadback();
+  }
+}
+
+void D3D12CommandProcessor::PrepareForLongWait() {
+  if (!REXCVAR_GET(d3d12_prefetch_at_wait) || !BeginSubmission(false)) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  uint32_t pages = shared_memory_->PrefetchUsedPages();
+  if (!pages) {
+    return;
+  }
+  diag::wait_prefetched_pages.fetch_add(pages, std::memory_order_relaxed);
+  diag::wait_prefetch_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count()),
+                                   std::memory_order_relaxed);
+  // Give the copies to the GPU now, so it does them after what it's catching up
+  // on rather than when the next frame's first draws are submitted.
+  if (memexport_readback_deferred_ranges_.empty() && !active_occlusion_query_.valid &&
+      !scratch_buffer_used_) {
+    EndSubmission(false);
   }
 }
 
@@ -3209,6 +3294,19 @@ void D3D12CommandProcessor::GetUnreadMemexportRanges(
       diag::upload_bytes_over_unread_memexport.fetch_add(unread_bytes, std::memory_order_relaxed);
     }
   }
+  if (keep_unread >= 2 && !async_readback_ranges_in_flight_.empty()) {
+    // Being copied back, not in guest memory yet.
+    uint32_t unread_bytes = 0;
+    for (const std::vector<draw_util::MemExportRange>& ranges : async_readback_ranges_in_flight_) {
+      for (const draw_util::MemExportRange& range : ranges) {
+        unread_bytes += append(range, true);
+      }
+    }
+    if (unread_bytes) {
+      diag::uploads_over_unread_memexport.fetch_add(1, std::memory_order_relaxed);
+      diag::upload_bytes_over_unread_memexport.fetch_add(unread_bytes, std::memory_order_relaxed);
+    }
+  }
   if (keep_unread >= 1 && lazy_readback_count_.load(std::memory_order_relaxed)) {
     auto global_lock = rex::thread::global_critical_region::AcquireDirect();
     for (const LazyReadback& readback : lazy_readbacks_) {
@@ -3387,7 +3485,14 @@ uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
   }
   readback->in_use = true;
   diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
+  diag::async_readbacks.fetch_add(1, std::memory_order_relaxed);
+  diag::draws_after_memexport_at_readback.fetch_add(draws_since_memexport_,
+                                                    std::memory_order_relaxed);
   size_t readback_index = size_t(readback - async_readback_buffers_.data());
+  bool track_in_flight = REXCVAR_GET(readback_memexport_eager_draws) > 0;
+  if (track_in_flight) {
+    async_readback_ranges_in_flight_.push_back(memexport_readback_deferred_ranges_);
+  }
 
   shared_memory_->UseAsCopySource();
   SubmitBarriers();
@@ -3405,17 +3510,21 @@ uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
   uint64_t token = submission_current_;
   EndSubmission(false);
 
-  QueueAsyncGuestVisibleWrite(
-      token, [this, readback_index, ranges = std::move(memexport_readback_deferred_ranges_)]() {
-        AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
-        const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
-        for (const draw_util::MemExportRange& memexport_range : ranges) {
-          std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
-                      readback_bytes, memexport_range.size_bytes);
-          readback_bytes += memexport_range.size_bytes;
-        }
-        readback.in_use = false;
-      });
+  QueueAsyncGuestVisibleWrite(token, [this, readback_index, track_in_flight,
+                                      ranges = std::move(memexport_readback_deferred_ranges_)]() {
+    AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
+    const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
+    for (const draw_util::MemExportRange& memexport_range : ranges) {
+      std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                  readback_bytes, memexport_range.size_bytes);
+      readback_bytes += memexport_range.size_bytes;
+    }
+    readback.in_use = false;
+    // Done in order.
+    if (track_in_flight && !async_readback_ranges_in_flight_.empty()) {
+      async_readback_ranges_in_flight_.pop_front();
+    }
+  });
   memexport_readback_deferred_ranges_.clear();
   memexport_readback_deferred_size_ = 0;
   return token;
@@ -3452,6 +3561,8 @@ bool D3D12CommandProcessor::MemexportReadbackFullPath(
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
+  diag::sync_readbacks.fetch_add(1, std::memory_order_relaxed);
+  diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kReadback);
   if (!AwaitAllQueueOperationsCompletion()) {
     return true;
   }
@@ -3922,11 +4033,12 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       PROFILE_CMD_BUFFER_STALL();
       const auto wait_start = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
-      diag::cp_gpu_wait_us.fetch_add(
-          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                       std::chrono::steady_clock::now() - wait_start)
-                       .count()),
-          std::memory_order_relaxed);
+      uint64_t wait_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - wait_start)
+                                      .count());
+      diag::cp_gpu_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+      diag::cp_gpu_wait_us_by_reason[size_t(diag::cp_gpu_wait)].fetch_add(
+          wait_us, std::memory_order_relaxed);
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -4072,8 +4184,12 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
+  {
+    diag::ScopedCpGpuWait gpu_wait_reason(is_opening_frame ? diag::CpGpuWait::kFrameQueue
+                                                           : diag::cp_gpu_wait);
+    CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
+                                          : 0);
+  }
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -4092,6 +4208,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    draws_in_submission_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are

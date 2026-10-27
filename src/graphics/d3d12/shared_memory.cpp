@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <iterator>
 #include <utility>
@@ -33,6 +34,12 @@ REXCVAR_DEFINE_BOOL(shared_memory_upload_prefetch, true, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(shared_memory_upload_prefetch_max_kb, 16384, "GPU/D3D12",
                      "Most memory shared_memory_upload_prefetch uploads with one batch, in KB")
     .range(4, 524288)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(shared_memory_upload_prefetch_frames, 1, "GPU/D3D12",
+                     "Which guest frames shared_memory_upload_prefetch uploads the pages the GPU "
+                     "used in: 1 - the previous frame, 2 - the one before it (for data the game "
+                     "writes to every other frame), 3 - both")
+    .range(1, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
@@ -321,17 +328,34 @@ void D3D12SharedMemory::UpdateUsedPagesFrame() {
     return;
   }
   size_t block_count = (kBufferSize >> page_size_log2()) >> 6;
-  if (used_in_frame_index_ + 1 == frame && used_in_frame_.size() == block_count) {
-    prefetch_candidates_.swap(used_in_frame_);
-  } else {
-    prefetch_candidates_.assign(block_count, 0);
+  if (prefetched_unused_.size() == block_count) {
+    uint64_t unused = 0;
+    for (uint64_t bits : prefetched_unused_) {
+      unused += std::popcount(bits);
+    }
+    if (unused) {
+      diag::prefetched_pages_unused.fetch_add(unused, std::memory_order_relaxed);
+    }
   }
+  prefetched_unused_.assign(block_count, 0);
+  if (used_in_frame_index_ + 1 != frame || used_in_frame_.size() != block_count ||
+      used_in_previous_frame_.size() != block_count) {
+    used_in_frame_.assign(block_count, 0);
+    used_in_previous_frame_.assign(block_count, 0);
+  }
+  int32_t frames = REXCVAR_GET(shared_memory_upload_prefetch_frames);
+  prefetch_candidates_.resize(block_count);
   prefetch_candidate_blocks_.clear();
-  for (uint32_t i = 0; i < uint32_t(prefetch_candidates_.size()); ++i) {
-    if (prefetch_candidates_[i]) {
+  for (uint32_t i = 0; i < uint32_t(block_count); ++i) {
+    uint64_t latest = used_in_frame_[i];
+    uint64_t previous = used_in_previous_frame_[i];
+    uint64_t candidates = frames == 2 ? previous : (frames >= 3 ? latest | previous : latest);
+    prefetch_candidates_[i] = candidates;
+    if (candidates) {
       prefetch_candidate_blocks_.push_back(i);
     }
   }
+  used_in_previous_frame_.swap(used_in_frame_);
   prefetch_generation_seen_ = UINT64_MAX;
   used_in_frame_.assign(block_count, 0);
   used_in_frame_index_ = frame;
@@ -354,7 +378,33 @@ void D3D12SharedMemory::RangeAccessedByGpu(uint32_t start, uint32_t length) {
       bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
     used_in_frame_[i] |= bits;
+    prefetched_unused_[i] &= ~bits;
   }
+}
+
+uint32_t D3D12SharedMemory::PrefetchUsedPages() {
+  if (!REXCVAR_GET(shared_memory_upload_prefetch) || used_in_frame_.empty() ||
+      used_in_frame_index_ + 1 < command_processor_.GetCurrentFrame()) {
+    return 0;
+  }
+  used_prefetch_candidates_ = used_in_frame_;
+  used_prefetch_candidate_blocks_.clear();
+  for (uint32_t i = 0; i < uint32_t(used_prefetch_candidates_.size()); ++i) {
+    if (used_prefetch_candidates_[i]) {
+      used_prefetch_candidate_blocks_.push_back(i);
+    }
+  }
+  used_prefetch_ranges_.clear();
+  uint32_t max_pages =
+      uint32_t(REXCVAR_GET(shared_memory_upload_prefetch_max_kb)) >> (page_size_log2() - 10);
+  uint64_t generation_seen = UINT64_MAX;
+  uint32_t pages =
+      TakeInvalidPages(used_prefetch_candidates_, used_prefetch_candidate_blocks_,
+                       std::max(max_pages, uint32_t(1)), used_prefetch_ranges_, generation_seen);
+  if (!pages || !UploadRanges(used_prefetch_ranges_)) {
+    return 0;
+  }
+  return pages;
 }
 
 bool D3D12SharedMemory::UploadRanges(
@@ -385,6 +435,14 @@ bool D3D12SharedMemory::UploadRanges(
     if (prefetched) {
       diag::prefetched_pages.fetch_add(prefetched, std::memory_order_relaxed);
       diag::prefetch_batches.fetch_add(1, std::memory_order_relaxed);
+      if (prefetched >= prefetch_max_pages) {
+        diag::prefetch_batches_full.fetch_add(1, std::memory_order_relaxed);
+      }
+      for (const std::pair<uint32_t, uint32_t>& range : prefetch_ranges_) {
+        for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+          prefetched_unused_[page >> 6] |= uint64_t(1) << (page & 63);
+        }
+      }
       upload_ranges_with_prefetch_.clear();
       std::merge(requested_page_ranges.begin(), requested_page_ranges.end(),
                  prefetch_ranges_.begin(), prefetch_ranges_.end(),

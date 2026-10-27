@@ -368,7 +368,10 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
-      PrepareForWait();
+      {
+        diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kIdle);
+        PrepareForWait();
+      }
       uint32_t loop_count = 0;
       const auto idle_start = std::chrono::steady_clock::now();
       auto idle_next_log = idle_start + std::chrono::seconds(3);
@@ -1244,8 +1247,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       if (!async_guest_writes_.empty()) {
         ++async_diag_.drains;
       }
-      FlushAsyncGuestVisibleWrites(true);
-      OnBeforeGuestVisibleWrite();
+      {
+        diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kRegToMem);
+        FlushAsyncGuestVisibleWrites(true);
+        OnBeforeGuestVisibleWrite();
+      }
       break;
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
@@ -1595,7 +1601,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           diag_sleep_ms = 0;
           diag_last_log = now_log;
         }
-        PrepareForWait();
+        PrepareForLongWait();
+        {
+          diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kWaitRegMem);
+          PrepareForWait();
+        }
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
@@ -1622,6 +1632,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
       } else {
         // The value may be written by a queued asynchronous write.
+        diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kWaitRegMem);
         FlushAsyncGuestVisibleWrites(true);
         rex::thread::MaybeYield();
       }

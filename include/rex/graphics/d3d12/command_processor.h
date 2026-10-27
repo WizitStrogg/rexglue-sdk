@@ -240,6 +240,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnBeforeGuestVisibleWrite() override;
   uint64_t PrepareAsyncGuestVisibleWrite() override;
   bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
+  void PrepareForLongWait() override;
   void PrepareForWait() override;
   void PrepareGuestMemoryReadByGpu(uint32_t physical_address, uint32_t length) override;
   void PrepareGuestMemoryReadByCommandProcessor(uint32_t physical_address, uint32_t length,
@@ -487,6 +488,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   HANDLE fence_completion_event_ = nullptr;
 
   bool submission_open_ = false;
+  // For d3d12_submission_interval_draws.
+  uint32_t draws_in_submission_ = 0;
   // Values of submission_fence_.
   uint64_t submission_current_ = 1;
   uint64_t submission_completed_ = 0;
@@ -883,6 +886,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool in_use = false;
   };
   std::vector<AsyncReadbackBuffer> async_readback_buffers_;
+  // Draws without memexport since the last one with it
+  // (readback_memexport_eager_draws).
+  uint32_t draws_since_memexport_ = 0;
+  // With readback_memexport_eager_draws, the destinations of the asynchronous
+  // readbacks not in guest memory yet, oldest first, so uploads keep the GPU's
+  // data there like for the deferred ranges.
+  std::deque<std::vector<draw_util::MemExportRange>> async_readback_ranges_in_flight_;
   // readback_memexport_lazy: memexport results being copied back, oldest
   // first. The guest pages they cover are inaccessible to the guest until the
   // copy is in guest memory, so guest-visible writes are done right away, and

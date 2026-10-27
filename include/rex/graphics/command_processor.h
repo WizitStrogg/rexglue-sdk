@@ -210,6 +210,9 @@ class CommandProcessor {
                                   bool* result);
 
   virtual void MakeCoherent();
+  // Before a WAIT_REG_MEM that the command processor may sleep in: work for
+  // later that it can do while the GPU catches up.
+  virtual void PrepareForLongWait() {}
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
