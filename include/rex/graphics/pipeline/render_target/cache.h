@@ -177,6 +177,14 @@ class RenderTargetCache {
   // diagnostic.
   void OnSwapForFrameLog();
 
+  // render_target_transfer_skip_overwritten: the pixel shader of the next
+  // Update's draw (nullptr if none), needed to know whether it may discard
+  // pixels. Without it, the draw isn't treated as overwriting anything.
+  void SetUpdatePixelShader(const Shader* pixel_shader) {
+    update_pixel_shader_ = pixel_shader;
+    update_pixel_shader_known_ = true;
+  }
+
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -525,6 +533,11 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
   }
+  // The area of the last update's transfers to leave out because the draw
+  // overwrites it in all of its render targets, or nullptr.
+  const Transfer::Rectangle* last_update_transfer_cutout() const {
+    return last_update_transfer_cutout_valid_ ? &last_update_transfer_cutout_ : nullptr;
+  }
 
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {
@@ -590,6 +603,20 @@ class RenderTargetCache {
   uint32_t draw_resolution_scale_y_;
 
   DrawExtentEstimator draw_extent_estimator_;
+
+  // render_target_transfer_skip_overwritten.
+  const Shader* update_pixel_shader_ = nullptr;
+  bool update_pixel_shader_known_ = false;
+  Transfer::Rectangle last_update_transfer_cutout_{};
+  bool last_update_transfer_cutout_valid_ = false;
+  // Whether the draw writes every sample of a rectangle in all of the render
+  // targets it uses (depth_and_color_rts_used_bits: 0 is depth, 1... color),
+  // such as clears, which Direct3D 9 on the Xbox 360 does by drawing one
+  // rectangle, and which pixels those are.
+  bool GetDrawOverwriteRectangle(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                 uint32_t depth_and_color_rts_used_bits,
+                                 const Shader& vertex_shader, const Shader* pixel_shader,
+                                 Transfer::Rectangle& rectangle_out);
 
   // For host render targets.
 
