@@ -11,15 +11,23 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <spdlog/details/os.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -29,6 +37,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
+#include <rex/thread.h>
 
 #if REX_PLATFORM_WIN32
 #include <spdlog/sinks/msvc_sink.h>
@@ -51,13 +60,128 @@ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in s
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(log_file_async, true, "Log",
+                    "Write the log file from a background thread, so threads that log (GPU "
+                    "commands, presenter, game) never wait on the disk. Error lines and "
+                    "explicit flushes still reach the file before the call returns.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 namespace {
 
+// File sink that keeps disk writes off the threads that log. Lines are
+// formatted into memory and a writer thread appends them to the file, so one
+// slow write (antivirus scan, busy disk) can't stall the GPU command thread
+// or the presenter for hundreds of milliseconds. Error and critical lines,
+// FlushSync and destruction write everything queued before returning; a
+// regular flush (flush_on level, flush_every) only wakes the writer.
+class AsyncFileSink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  explicit AsyncFileSink(const spdlog::filename_t& filename) {
+    spdlog::details::os::create_dir(spdlog::details::os::dir_name(filename));
+    if (spdlog::details::os::fopen_s(&file_, filename, SPDLOG_FILENAME_T("ab"))) {
+      spdlog::throw_spdlog_ex(
+          "Failed opening file " + spdlog::details::os::filename_to_str(filename), errno);
+    }
+    writer_ = std::thread([this] { WriterLoop(); });
+  }
+
+  ~AsyncFileSink() override {
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    wake_cv_.notify_one();
+    writer_.join();
+    std::fclose(file_);
+  }
+
+  // Writes everything logged so far, including a write already in flight.
+  void FlushSync() {
+    std::lock_guard lock(mutex_);
+    WritePendingLocked();
+  }
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    spdlog::memory_buf_t formatted;
+    formatter_->format(msg, formatted);
+    pending_.append(formatted.data(), formatted.size());
+    if (msg.level >= spdlog::level::err || pending_.size() >= kMaxPendingBytes) {
+      // Errors often come right before a crash; also bound memory if the
+      // disk stalls for a long time.
+      WritePendingLocked();
+    } else if (pending_.size() >= kWakeBytes) {
+      WakeWriter();
+    }
+  }
+
+  void flush_() override {
+    if (!pending_.empty())
+      WakeWriter();
+  }
+
+ private:
+  static constexpr size_t kWakeBytes = 64 * 1024;
+  static constexpr size_t kMaxPendingBytes = 8 * 1024 * 1024;
+  static constexpr std::chrono::milliseconds kWriteInterval{100};
+
+  void WakeWriter() {
+    wake_ = true;
+    wake_cv_.notify_one();
+  }
+
+  // With mutex_ held. Lock order is mutex_ then io_mutex_ everywhere, and the
+  // writer takes io_mutex_ before releasing mutex_, so file order matches
+  // logging order.
+  void WritePendingLocked() {
+    std::lock_guard io(io_mutex_);
+    WriteToFile(pending_);
+    pending_.clear();
+  }
+
+  void WriteToFile(const std::string& data) {
+    if (data.empty())
+      return;
+    std::fwrite(data.data(), 1, data.size(), file_);
+    std::fflush(file_);
+  }
+
+  void WriterLoop() {
+    rex::thread::set_current_thread_name("Log Writer");
+    std::unique_lock lock(mutex_);
+    while (true) {
+      wake_cv_.wait_for(lock, kWriteInterval, [this] { return stop_ || wake_; });
+      wake_ = false;
+      if (!pending_.empty()) {
+        writing_.swap(pending_);
+        std::unique_lock io(io_mutex_);
+        lock.unlock();
+        WriteToFile(writing_);
+        writing_.clear();
+        io.unlock();
+        lock.lock();
+      }
+      if (stop_ && pending_.empty())
+        return;
+    }
+  }
+
+  std::FILE* file_ = nullptr;
+  std::string pending_;  // Guarded by mutex_.
+  std::string writing_;  // Writer thread only.
+  std::mutex io_mutex_;  // Held while writing to file_.
+  std::condition_variable wake_cv_;
+  bool wake_ = false;  // Guarded by mutex_.
+  bool stop_ = false;  // Guarded by mutex_.
+  std::thread writer_;
+};
+
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
+std::shared_ptr<AsyncFileSink> g_async_file_sink;  // g_file_sink when it's async.
 spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
@@ -268,7 +392,13 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    spdlog::sink_ptr sink;
+    if (REXCVAR_GET(log_file_async)) {
+      g_async_file_sink = std::make_shared<AsyncFileSink>(resolved_path.string());
+      sink = g_async_file_sink;
+    } else {
+      sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    }
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
@@ -315,11 +445,14 @@ void ShutdownLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+  if (g_async_file_sink)
+    g_async_file_sink->FlushSync();
 
   spdlog::shutdown();
   g_registry.clear();
   g_console_sink.reset();
   g_file_sink.reset();
+  g_async_file_sink.reset();
   g_early_sink.reset();
   g_extra_sinks.clear();
   g_initialized = false;
@@ -331,6 +464,8 @@ void FlushLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+  if (g_async_file_sink)
+    g_async_file_sink->FlushSync();
 }
 
 LogCategoryId RegisterLogCategory(const char* name) {
