@@ -260,24 +260,25 @@ bool LobbyPanelDialog::EnsureFont() {
   return font_texture_ != nullptr;
 }
 
-void LobbyPanelDialog::DrawToast(ImGuiIO& io) {
+// The toast to draw this frame: its text and ms left, or false. With none up
+// this is one atomic load.
+static bool TakeToast(std::string& text, int64_t& left) {
   int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
-  if (!until) return;
-  const int64_t left = until - SteadyMs();
+  if (!until) return false;
+  left = until - SteadyMs();
   if (left <= 0) {
     g_toast_until_ms.compare_exchange_strong(until, 0);
-    return;
+    return false;
   }
-  std::string text;
   {
     std::lock_guard<std::mutex> lock(g_view_mutex);
-    if (!g_cover.empty()) return;  // the cover hides everything anyway
+    if (!g_cover.empty()) return false;  // the cover hides everything anyway
     text = g_toast;
   }
-  if (text.empty()) return;
+  return !text.empty();
+}
 
-  const ImTextureID tex =
-      EnsureFont() ? reinterpret_cast<ImTextureID>(font_texture_.get()) : ImTextureID{};
+static void DrawToast(ImGuiIO& io, ImTextureID tex, const std::string& text, int64_t left) {
   const float W = io.DisplaySize.x, H = io.DisplaySize.y;
   const float s = std::min(W / 1280.0f, H / 720.0f);
   const float lh = (g_font.loaded ? g_font.line_h : 32.0f);
@@ -299,7 +300,9 @@ void LobbyPanelDialog::DrawToast(ImGuiIO& io) {
 }
 
 void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
-  DrawToast(io);  // independent of the view and drawn even when it is empty
+  std::string toast;
+  int64_t toast_left = 0;
+  const bool has_toast = TakeToast(toast, toast_left);  // drawn even when the view is empty
   std::string view;
   {
     std::lock_guard<std::mutex> lock(g_view_mutex);
@@ -322,10 +325,14 @@ void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
     REXLOG_INFO("[lobby-panel] draw: view {} bytes, display {}x{}", view.size(), io.DisplaySize.x,
                 io.DisplaySize.y);
   }
-  if (view.empty()) return;
+  if (view.empty() && !has_toast) return;
 
+  // The font is resolved once per frame: a second EnsureFont after a font change
+  // from another thread would free the texture the toast's draw commands hold.
   const ImTextureID tex =
       EnsureFont() ? reinterpret_cast<ImTextureID>(font_texture_.get()) : ImTextureID{};
+  if (has_toast) DrawToast(io, tex, toast, toast_left);
+  if (view.empty()) return;
   std::vector<Line> lines;
   std::string title, cover;
   {

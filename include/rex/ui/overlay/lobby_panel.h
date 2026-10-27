@@ -38,7 +38,6 @@ class LobbyPanelDialog : public ImGuiDialog {
 
  private:
   bool EnsureFont();
-  void DrawToast(ImGuiIO& io);
   std::unique_ptr<ImmediateTexture> font_texture_;
   ImmediateDrawer* font_drawer_ = nullptr;  // the drawer the texture belongs to
 };
