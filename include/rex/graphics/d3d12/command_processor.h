@@ -240,6 +240,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void OnBeforeGuestVisibleWrite() override;
   uint64_t PrepareAsyncGuestVisibleWrite() override;
   bool IsAsyncGuestVisibleWriteReady(uint64_t token, bool wait) override;
+  void PrepareForLongWait() override;
   void PrepareForWait() override;
   void PrepareGuestMemoryReadByGpu(uint32_t physical_address, uint32_t length) override;
   void PrepareGuestMemoryReadByCommandProcessor(uint32_t physical_address, uint32_t length,

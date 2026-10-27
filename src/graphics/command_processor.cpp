@@ -1601,6 +1601,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           diag_sleep_ms = 0;
           diag_last_log = now_log;
         }
+        PrepareForLongWait();
         {
           diag::ScopedCpGpuWait gpu_wait_reason(diag::CpGpuWait::kWaitRegMem);
           PrepareForWait();

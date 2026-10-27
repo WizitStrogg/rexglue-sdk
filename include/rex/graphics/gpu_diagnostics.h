@@ -160,6 +160,10 @@ inline std::atomic<uint64_t> sync_readbacks{0};
 inline std::atomic<uint64_t> async_readbacks{0};
 inline std::atomic<uint64_t> eager_readbacks{0};
 inline std::atomic<uint64_t> draws_after_memexport_at_readback{0};
+// d3d12_prefetch_at_wait: pages uploaded before a WAIT_REG_MEM, and the command
+// processor time it took.
+inline std::atomic<uint64_t> wait_prefetched_pages{0};
+inline std::atomic<uint64_t> wait_prefetch_us{0};
 // Time the submission thread spent replaying and submitting command lists, and
 // time the command processor spent waiting for it.
 inline std::atomic<uint64_t> submission_thread_us{0};
@@ -320,6 +324,8 @@ inline std::string TakeCpGpuWaitSummary() {
       fmt::format(", asynchronous readbacks {} ({} eager) after {} draws without memexport in all",
                   async_readbacks.exchange(0), eager_readbacks.exchange(0),
                   draws_after_memexport_at_readback.exchange(0));
+  summary += fmt::format(", prefetched before waits {} pages in {} ms",
+                         wait_prefetched_pages.exchange(0), wait_prefetch_us.exchange(0) / 1000);
   return summary;
 }
 

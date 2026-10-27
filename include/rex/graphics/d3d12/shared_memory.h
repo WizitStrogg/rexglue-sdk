@@ -66,6 +66,11 @@ class D3D12SharedMemory : public SharedMemory {
     }
   }
 
+  // shared_memory_upload_prefetch: uploads the pages the GPU has used in the
+  // latest guest frame that the CPU has changed since, as the first upload of
+  // the next frame would, into the open submission. Returns the pages.
+  uint32_t PrefetchUsedPages();
+
   void WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   // Due to the D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP limitation, the
@@ -105,6 +110,10 @@ class D3D12SharedMemory : public SharedMemory {
   uint64_t used_in_frame_index_ = UINT64_MAX;
   std::vector<std::pair<uint32_t, uint32_t>> prefetch_ranges_;
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_with_prefetch_;
+  // PrefetchUsedPages.
+  std::vector<uint64_t> used_prefetch_candidates_;
+  std::vector<uint32_t> used_prefetch_candidate_blocks_;
+  std::vector<std::pair<uint32_t, uint32_t>> used_prefetch_ranges_;
   D3D12_RESOURCE_STATES buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
   bool buffer_uav_writes_commit_needed_ = false;
   void CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATES new_state);

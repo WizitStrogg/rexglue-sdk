@@ -357,6 +357,31 @@ void D3D12SharedMemory::RangeAccessedByGpu(uint32_t start, uint32_t length) {
   }
 }
 
+uint32_t D3D12SharedMemory::PrefetchUsedPages() {
+  if (!REXCVAR_GET(shared_memory_upload_prefetch) || used_in_frame_.empty() ||
+      used_in_frame_index_ + 1 < command_processor_.GetCurrentFrame()) {
+    return 0;
+  }
+  used_prefetch_candidates_ = used_in_frame_;
+  used_prefetch_candidate_blocks_.clear();
+  for (uint32_t i = 0; i < uint32_t(used_prefetch_candidates_.size()); ++i) {
+    if (used_prefetch_candidates_[i]) {
+      used_prefetch_candidate_blocks_.push_back(i);
+    }
+  }
+  used_prefetch_ranges_.clear();
+  uint32_t max_pages =
+      uint32_t(REXCVAR_GET(shared_memory_upload_prefetch_max_kb)) >> (page_size_log2() - 10);
+  uint64_t generation_seen = UINT64_MAX;
+  uint32_t pages =
+      TakeInvalidPages(used_prefetch_candidates_, used_prefetch_candidate_blocks_,
+                       std::max(max_pages, uint32_t(1)), used_prefetch_ranges_, generation_seen);
+  if (!pages || !UploadRanges(used_prefetch_ranges_)) {
+    return 0;
+  }
+  return pages;
+}
+
 bool D3D12SharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& requested_page_ranges) {
   if (requested_page_ranges.empty()) {

@@ -132,6 +132,14 @@ REXCVAR_DEFINE_INT32(d3d12_submission_interval_draws, 0, "GPU/D3D12",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_prefetch_at_wait, false, "GPU/D3D12",
+                    "With shared_memory_upload_prefetch, before a WAIT_REG_MEM the command "
+                    "processor may sleep in (once a frame, waiting for the GPU), upload the "
+                    "guest memory the GPU used in the frame that the CPU has changed since, "
+                    "which the first upload of the next frame would otherwise do while the GPU "
+                    "has nothing to work on")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamps, false, "GPU/D3D12",
                     "Measure the host GPU time of each submission with timestamp queries "
                     "(for the performance diagnostics log)");
@@ -2969,6 +2977,28 @@ void D3D12CommandProcessor::OnBeforeGuestVisibleWrite() {
     IssueLazyMemexportReadback();
   } else {
     FlushDeferredMemexportReadback();
+  }
+}
+
+void D3D12CommandProcessor::PrepareForLongWait() {
+  if (!REXCVAR_GET(d3d12_prefetch_at_wait) || !BeginSubmission(false)) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  uint32_t pages = shared_memory_->PrefetchUsedPages();
+  if (!pages) {
+    return;
+  }
+  diag::wait_prefetched_pages.fetch_add(pages, std::memory_order_relaxed);
+  diag::wait_prefetch_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count()),
+                                   std::memory_order_relaxed);
+  // Give the copies to the GPU now, so it does them after what it's catching up
+  // on rather than when the next frame's first draws are submitted.
+  if (memexport_readback_deferred_ranges_.empty() && !active_occlusion_query_.valid &&
+      !scratch_buffer_used_) {
+    EndSubmission(false);
   }
 }
 
