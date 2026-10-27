@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 
@@ -1038,9 +1039,17 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
+  // The bits are set by resolves on this thread and cleared by CPU write
+  // faults, which run before the faulting write, so like the shared memory
+  // valid bits they can be read without the global critical region (the
+  // command processor waited for it here for 1.5% of its time).
+  std::unique_lock<std::recursive_mutex> global_lock;
+  if (!REXCVAR_GET(gpu_lockless_page_checks)) {
+    global_lock = global_critical_region_.Acquire();
+  }
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
-    uint64_t l2_block = scaled_resolve_pages_l2_[i];
+    uint64_t l2_block =
+        std::atomic_ref<uint64_t>(scaled_resolve_pages_l2_[i]).load(std::memory_order_acquire);
     if (i == l2_block_first) {
       l2_block &= ~((UINT64_C(1) << (block_first & 63)) - 1);
     }
@@ -1058,7 +1067,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
       if (block_index == block_last && (page_last & 31) != 31) {
         check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      if (scaled_resolve_pages_[block_index] & check_bits) {
+      if (std::atomic_ref<uint32_t>(scaled_resolve_pages_[block_index])
+              .load(std::memory_order_acquire) &
+          check_bits) {
         return true;
       }
     }

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <utility>
@@ -28,6 +29,13 @@ REXCVAR_DEFINE_BOOL(shared_memory_preserve_gpu_writes, false, "GPU",
                     "been read back yet (always possible with memexport readback off), upload "
                     "only the dwords the CPU changed, keeping the GPU's results in the rest. A "
                     "CPU write of the value the stale guest copy already holds is lost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_lockless_page_checks, true, "GPU",
+                    "Check whether a draw's memory is already valid on the GPU (and whether a "
+                    "texture's memory holds scaled resolves) without the global critical region, "
+                    "which guest write faults and the kernel also take. The locked path still "
+                    "runs when something needs uploading")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
@@ -117,8 +125,7 @@ bool SharedMemory::TakeCpuWriteSnapshot(uint32_t page, std::vector<uint32_t>& sn
   }
   snapshot_out = std::move(it->second);
   cpu_write_snapshots_.erase(it);
-  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()),
-                                  std::memory_order_relaxed);
+  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()), std::memory_order_relaxed);
   return true;
 }
 
@@ -130,8 +137,7 @@ void SharedMemory::DropCpuWriteSnapshots(uint32_t page_first, uint32_t page_last
   for (uint32_t page = page_first; page <= page_last; ++page) {
     cpu_write_snapshots_.erase(page);
   }
-  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()),
-                                  std::memory_order_relaxed);
+  cpu_write_snapshot_count_.store(uint32_t(cpu_write_snapshots_.size()), std::memory_order_relaxed);
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -435,6 +441,13 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
+  if (REXCVAR_GET(gpu_lockless_page_checks) && AreRangesValidUnlocked(merged_ranges)) {
+    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+      RangeAccessedByGpu(range.first, range.second);
+    }
+    return true;
+  }
+
   upload_ranges_.clear();
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {
@@ -515,8 +528,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 }
 
 uint32_t SharedMemory::TakeInvalidPages(std::vector<uint64_t>& candidates,
-                                        std::vector<uint32_t>& candidate_blocks,
-                                        uint32_t max_pages,
+                                        std::vector<uint32_t>& candidate_blocks, uint32_t max_pages,
                                         std::vector<std::pair<uint32_t, uint32_t>>& ranges_out,
                                         uint64_t& generation_seen) {
   auto global_lock = global_critical_region_.Acquire();
@@ -533,10 +545,9 @@ uint32_t SharedMemory::TakeInvalidPages(std::vector<uint64_t>& candidates,
       uint64_t bits = candidates[i] & ~system_page_flags_valid_[i];
       while (bits && taken < max_pages) {
         uint32_t bit = uint32_t(std::countr_zero(bits));
-        uint32_t run_length =
-            std::min(uint32_t(std::countr_one(bits >> bit)), max_pages - taken);
-        uint64_t run_mask =
-            (run_length >= 64 ? UINT64_MAX : (uint64_t(1) << run_length) - 1) << bit;
+        uint32_t run_length = std::min(uint32_t(std::countr_one(bits >> bit)), max_pages - taken);
+        uint64_t run_mask = (run_length >= 64 ? UINT64_MAX : (uint64_t(1) << run_length) - 1)
+                            << bit;
         bits &= ~run_mask;
         candidates[i] &= ~run_mask;
         uint32_t page = (i << 6) + bit;
@@ -558,6 +569,37 @@ uint32_t SharedMemory::TakeInvalidPages(std::vector<uint64_t>& candidates,
     generation_seen = invalidation_generation_;
   }
   return taken;
+}
+
+bool SharedMemory::AreRangesValidUnlocked(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  // Most draws only use memory that is already valid on the GPU, so check that
+  // without the global critical region: guest write faults and much of the
+  // kernel take it too, and the command processor spent about 4% of its time
+  // waiting for it here. The bits are only cleared by write faults, which run
+  // before the faulting write and so before the guest submits anything that
+  // depends on it. Seeing a bit an instant before a concurrent fault clears it
+  // is the same as taking the lock just before the fault.
+  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
+    uint32_t page_first = range.first >> page_size_log2_;
+    uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+    uint32_t block_first = page_first >> 6;
+    uint32_t block_last = page_last >> 6;
+    for (uint32_t i = block_first; i <= block_last; ++i) {
+      uint64_t block_valid =
+          std::atomic_ref<uint64_t>(system_page_flags_valid_[i]).load(std::memory_order_acquire);
+      if (i == block_first) {
+        block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
+      }
+      if (i == block_last && (page_last & 63) != 63) {
+        block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+      }
+      if (~block_valid) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

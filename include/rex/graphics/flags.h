@@ -20,6 +20,7 @@ REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, half_pixel_offset_host_scaled);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, async_pipeline_wait);
+REXCVAR_DECLARE(bool, gpu_lockless_page_checks);
 REXCVAR_DECLARE(int32_t, async_pipeline_wait_timeout_ms);
 
 // GPU Resolution / Readback / Queries

@@ -177,6 +177,9 @@ class SharedMemory {
   uint32_t page_size_log2_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
+  // True if every page of the (sorted, merged) ranges is valid, checked
+  // without the global critical region.
+  bool AreRangesValidUnlocked(const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
