@@ -52,6 +52,10 @@ inline std::atomic<uint64_t> pages_reuploaded_in_frame{0};
 // uploaded along with a batch before being requested, and the batches.
 inline std::atomic<uint64_t> prefetched_pages{0};
 inline std::atomic<uint64_t> prefetch_batches{0};
+// Prefetched pages the GPU didn't use in the rest of the frame, and batches
+// that prefetched shared_memory_upload_prefetch_max_kb.
+inline std::atomic<uint64_t> prefetched_pages_unused{0};
+inline std::atomic<uint64_t> prefetch_batches_full{0};
 // Invalidations of shared memory by CPU writes (and other guest memory
 // changes), and the pages invalidated (with the expansion around them).
 inline std::atomic<uint64_t> cpu_invalidations{0};
@@ -326,6 +330,8 @@ inline std::string TakeCpGpuWaitSummary() {
                   draws_after_memexport_at_readback.exchange(0));
   summary += fmt::format(", prefetched before waits {} pages in {} ms",
                          wait_prefetched_pages.exchange(0), wait_prefetch_us.exchange(0) / 1000);
+  summary += fmt::format(", prefetched pages unused in their frame {}, full prefetch batches {}",
+                         prefetched_pages_unused.exchange(0), prefetch_batches_full.exchange(0));
   return summary;
 }
 

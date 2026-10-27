@@ -100,10 +100,15 @@ class D3D12SharedMemory : public SharedMemory {
   std::vector<uint64_t> uploaded_in_frame_;
   uint64_t uploaded_in_frame_index_ = 0;
   // shared_memory_upload_prefetch: pages the GPU used in the guest frame
-  // used_in_frame_index_, and those it used in the previous frame not
-  // uploaded with a batch yet in this one.
+  // used_in_frame_index_ and in the frame before it, and those used in the
+  // frames chosen by shared_memory_upload_prefetch_frames not uploaded with a
+  // batch yet in this one.
   void UpdateUsedPagesFrame();
   std::vector<uint64_t> used_in_frame_;
+  std::vector<uint64_t> used_in_previous_frame_;
+  // Diagnostics: pages prefetched in the guest frame used_in_frame_index_ that
+  // the GPU hasn't used since.
+  std::vector<uint64_t> prefetched_unused_;
   std::vector<uint64_t> prefetch_candidates_;
   std::vector<uint32_t> prefetch_candidate_blocks_;
   uint64_t prefetch_generation_seen_ = UINT64_MAX;
