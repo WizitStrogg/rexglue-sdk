@@ -153,6 +153,13 @@ inline std::atomic<uint64_t> interval_submissions{0};
 inline std::atomic<uint64_t> interval_submissions_deferred{0};
 // Memexport results read back with the command processor waiting for the GPU.
 inline std::atomic<uint64_t> sync_readbacks{0};
+// readback_memexport_async: readbacks, those issued after
+// readback_memexport_eager_draws draws, and the draws without memexport between
+// the last memexport draw and each readback (GPU work the guest-visible writes
+// queued behind the readback also wait for).
+inline std::atomic<uint64_t> async_readbacks{0};
+inline std::atomic<uint64_t> eager_readbacks{0};
+inline std::atomic<uint64_t> draws_after_memexport_at_readback{0};
 // Time the submission thread spent replaying and submitting command lists, and
 // time the command processor spent waiting for it.
 inline std::atomic<uint64_t> submission_thread_us{0};
@@ -309,6 +316,10 @@ inline std::string TakeCpGpuWaitSummary() {
   summary += fmt::format(" ms, synchronous readbacks {}, interval submissions {} ({} deferred)",
                          sync_readbacks.exchange(0), interval_submissions.exchange(0),
                          interval_submissions_deferred.exchange(0));
+  summary +=
+      fmt::format(", asynchronous readbacks {} ({} eager) after {} draws without memexport in all",
+                  async_readbacks.exchange(0), eager_readbacks.exchange(0),
+                  draws_after_memexport_at_readback.exchange(0));
   return summary;
 }
 

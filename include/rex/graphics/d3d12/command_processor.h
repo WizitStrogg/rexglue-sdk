@@ -885,6 +885,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool in_use = false;
   };
   std::vector<AsyncReadbackBuffer> async_readback_buffers_;
+  // Draws without memexport since the last one with it
+  // (readback_memexport_eager_draws).
+  uint32_t draws_since_memexport_ = 0;
+  // With readback_memexport_eager_draws, the destinations of the asynchronous
+  // readbacks not in guest memory yet, oldest first, so uploads keep the GPU's
+  // data there like for the deferred ranges.
+  std::deque<std::vector<draw_util::MemExportRange>> async_readback_ranges_in_flight_;
   // readback_memexport_lazy: memexport results being copied back, oldest
   // first. The guest pages they cover are inaccessible to the guest until the
   // copy is in guest memory, so guest-visible writes are done right away, and

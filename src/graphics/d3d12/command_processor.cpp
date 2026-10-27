@@ -56,6 +56,15 @@ REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU/D3D12",
                     "processor and the GPU working in parallel.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(readback_memexport_eager_draws, 0, "GPU/D3D12",
+                     "With readback_memexport_async, read the memexport results back once this "
+                     "many draws without memexport have followed the last one, instead of at the "
+                     "next fence write, interrupt or wait, so the fence writes and interrupts "
+                     "queued behind the readback don't also wait for the GPU to do those later "
+                     "draws (0 = off)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport_lazy, false, "GPU/D3D12",
                     "With readback_memexport_deferred, do fence writes and interrupts right "
                     "away, and make the memory the memexport results are being copied back to "
@@ -2903,12 +2912,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // The fence writes and interrupts after memexport are queued behind its
+  // readback, which otherwise is only issued at the first of them, so they also
+  // wait for the GPU to do all the draws in between (the swap interrupt, which
+  // the command processor waits for once a frame, too).
+  if (memexport_used) {
+    draws_since_memexport_ = 0;
+  } else if (!memexport_readback_deferred_ranges_.empty()) {
+    ++draws_since_memexport_;
+    int32_t eager_draws = REXCVAR_GET(readback_memexport_eager_draws);
+    if (eager_draws > 0 && draws_since_memexport_ >= uint32_t(eager_draws) &&
+        !REXCVAR_GET(readback_memexport_lazy) && PrepareAsyncGuestVisibleWrite()) {
+      diag::eager_readbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   // Otherwise the GPU only gets the draws when a memexport readback or the
   // frame ends the submission, and a long stretch without either leaves it idle
   // while the command processor records, then far behind when the command
   // processor next waits for it (once a frame, for the swap interrupt).
   int32_t submission_interval_draws = REXCVAR_GET(d3d12_submission_interval_draws);
-  if (submission_interval_draws > 0 &&
+  if (submission_interval_draws > 0 && submission_open_ &&
       ++draws_in_submission_ >= uint32_t(submission_interval_draws)) {
     // Memexport results waiting for their readback must be copied in this
     // submission (PrepareAsyncGuestVisibleWrite needs it open), and an
@@ -3237,6 +3261,19 @@ void D3D12CommandProcessor::GetUnreadMemexportRanges(
       diag::upload_bytes_over_unread_memexport.fetch_add(unread_bytes, std::memory_order_relaxed);
     }
   }
+  if (keep_unread >= 2 && !async_readback_ranges_in_flight_.empty()) {
+    // Being copied back, not in guest memory yet.
+    uint32_t unread_bytes = 0;
+    for (const std::vector<draw_util::MemExportRange>& ranges : async_readback_ranges_in_flight_) {
+      for (const draw_util::MemExportRange& range : ranges) {
+        unread_bytes += append(range, true);
+      }
+    }
+    if (unread_bytes) {
+      diag::uploads_over_unread_memexport.fetch_add(1, std::memory_order_relaxed);
+      diag::upload_bytes_over_unread_memexport.fetch_add(unread_bytes, std::memory_order_relaxed);
+    }
+  }
   if (keep_unread >= 1 && lazy_readback_count_.load(std::memory_order_relaxed)) {
     auto global_lock = rex::thread::global_critical_region::AcquireDirect();
     for (const LazyReadback& readback : lazy_readbacks_) {
@@ -3415,7 +3452,14 @@ uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
   }
   readback->in_use = true;
   diag::readback_bytes.fetch_add(total_size, std::memory_order_relaxed);
+  diag::async_readbacks.fetch_add(1, std::memory_order_relaxed);
+  diag::draws_after_memexport_at_readback.fetch_add(draws_since_memexport_,
+                                                    std::memory_order_relaxed);
   size_t readback_index = size_t(readback - async_readback_buffers_.data());
+  bool track_in_flight = REXCVAR_GET(readback_memexport_eager_draws) > 0;
+  if (track_in_flight) {
+    async_readback_ranges_in_flight_.push_back(memexport_readback_deferred_ranges_);
+  }
 
   shared_memory_->UseAsCopySource();
   SubmitBarriers();
@@ -3433,17 +3477,21 @@ uint64_t D3D12CommandProcessor::PrepareAsyncGuestVisibleWrite() {
   uint64_t token = submission_current_;
   EndSubmission(false);
 
-  QueueAsyncGuestVisibleWrite(
-      token, [this, readback_index, ranges = std::move(memexport_readback_deferred_ranges_)]() {
-        AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
-        const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
-        for (const draw_util::MemExportRange& memexport_range : ranges) {
-          std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
-                      readback_bytes, memexport_range.size_bytes);
-          readback_bytes += memexport_range.size_bytes;
-        }
-        readback.in_use = false;
-      });
+  QueueAsyncGuestVisibleWrite(token, [this, readback_index, track_in_flight,
+                                      ranges = std::move(memexport_readback_deferred_ranges_)]() {
+    AsyncReadbackBuffer& readback = async_readback_buffers_[readback_index];
+    const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapping);
+    for (const draw_util::MemExportRange& memexport_range : ranges) {
+      std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                  readback_bytes, memexport_range.size_bytes);
+      readback_bytes += memexport_range.size_bytes;
+    }
+    readback.in_use = false;
+    // Done in order.
+    if (track_in_flight && !async_readback_ranges_in_flight_.empty()) {
+      async_readback_ranges_in_flight_.pop_front();
+    }
+  });
   memexport_readback_deferred_ranges_.clear();
   memexport_readback_deferred_size_ = 0;
   return token;
