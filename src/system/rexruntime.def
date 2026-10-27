@@ -310,6 +310,8 @@ rex_ui_set_lobby_font
 rex_ui_set_lobby_cover
 rex_content_set_save_filter
 rex_content_save_busy
+rex_ui_set_toast
+rex_session_ending
 __imp__NetDll_accept
 __imp__NetDll_bind
 __imp__NetDll_closesocket

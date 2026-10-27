@@ -21,6 +21,8 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +42,16 @@ std::mutex g_view_mutex;
 std::string g_view;
 std::string g_cover;
 std::string g_font_path;
+// The toast (rex_ui_set_toast): text under g_view_mutex; until = steady-clock ms
+// it hides at, 0 = none (the presenter reads only this while no toast is up).
+std::string g_toast;
+std::atomic<int64_t> g_toast_until_ms{0};
+
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // --- the game's bitmap font -------------------------------------------------------
 
@@ -248,7 +260,46 @@ bool LobbyPanelDialog::EnsureFont() {
   return font_texture_ != nullptr;
 }
 
+void LobbyPanelDialog::DrawToast(ImGuiIO& io) {
+  int64_t until = g_toast_until_ms.load(std::memory_order_relaxed);
+  if (!until) return;
+  const int64_t left = until - SteadyMs();
+  if (left <= 0) {
+    g_toast_until_ms.compare_exchange_strong(until, 0);
+    return;
+  }
+  std::string text;
+  {
+    std::lock_guard<std::mutex> lock(g_view_mutex);
+    if (!g_cover.empty()) return;  // the cover hides everything anyway
+    text = g_toast;
+  }
+  if (text.empty()) return;
+
+  const ImTextureID tex =
+      EnsureFont() ? reinterpret_cast<ImTextureID>(font_texture_.get()) : ImTextureID{};
+  const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+  const float s = std::min(W / 1280.0f, H / 720.0f);
+  const float lh = (g_font.loaded ? g_font.line_h : 32.0f);
+  const float ts = 0.66f * s;
+  // Fades out over its last 300 ms.
+  const float fade = std::min(1.0f, float(left) / 300.0f);
+  auto alpha = [fade](ImU32 c) {
+    return (c & ~IM_COL32_A_MASK) | (ImU32(((c >> IM_COL32_A_SHIFT) & 0xFF) * fade) << IM_COL32_A_SHIFT);
+  };
+  // A small pill at the bottom centre, clear of the game's own HUD corners.
+  const float tw = TextWidth(text, ts), pad = 18 * s, ph = lh * ts + 14 * s;
+  const ImVec2 a(W * 0.5f - tw * 0.5f - pad, H * 0.80f), b(W * 0.5f + tw * 0.5f + pad, H * 0.80f + ph);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  dl->AddRectFilled(ImVec2(a.x + 2 * s, a.y + 3 * s), ImVec2(b.x + 2 * s, b.y + 3 * s),
+                    alpha(IM_COL32(0, 0, 0, 110)), ph * 0.5f);
+  dl->AddRectFilled(a, b, alpha(kBarFill), ph * 0.5f);
+  dl->AddRect(a, b, alpha(kCopper), ph * 0.5f, 0, 2.0f * s);
+  DrawText(dl, tex, ImVec2(a.x + pad, a.y + 7 * s), ts, alpha(kGold), text);
+}
+
 void LobbyPanelDialog::OnDraw(ImGuiIO& io) {
+  DrawToast(io);  // independent of the view and drawn even when it is empty
   std::string view;
   {
     std::lock_guard<std::mutex> lock(g_view_mutex);
@@ -403,4 +454,13 @@ extern "C" void rex_ui_set_lobby_cover(const char* text) {
 extern "C" void rex_ui_set_lobby_font(const char* bft_path) {
   std::lock_guard<std::mutex> lock(rex::ui::g_view_mutex);
   rex::ui::g_font_path = bft_path ? bft_path : "";
+}
+
+extern "C" void rex_ui_set_toast(const char* text, int ms) {
+  const bool show = text && *text && ms > 0;
+  {
+    std::lock_guard<std::mutex> lock(rex::ui::g_view_mutex);
+    rex::ui::g_toast = show ? text : "";
+  }
+  rex::ui::g_toast_until_ms.store(show ? rex::ui::SteadyMs() + ms : 0);
 }

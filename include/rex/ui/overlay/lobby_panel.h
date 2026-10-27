@@ -38,6 +38,7 @@ class LobbyPanelDialog : public ImGuiDialog {
 
  private:
   bool EnsureFont();
+  void DrawToast(ImGuiIO& io);
   std::unique_ptr<ImmediateTexture> font_texture_;
   ImmediateDrawer* font_drawer_ = nullptr;  // the drawer the texture belongs to
 };
@@ -52,3 +53,7 @@ extern "C" void rex_ui_set_lobby_view(const char* view);
 extern "C" void rex_ui_set_lobby_cover(const char* text);
 // The .bft font the panel draws with ("" = ImGui's own font). Any thread.
 extern "C" void rex_ui_set_lobby_font(const char* bft_path);
+// A one-line hint (UTF-8) shown small at the bottom centre for `ms`
+// milliseconds, under the cover and over the game; a new call replaces it,
+// "" or ms <= 0 hides it. Draws nothing while none is up. Any thread.
+extern "C" void rex_ui_set_toast(const char* text, int ms);

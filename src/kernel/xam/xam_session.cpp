@@ -9,6 +9,7 @@
 #include "xam_session.h"
 #include "xam_lan_lobby.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -23,6 +24,11 @@
 namespace rex::kernel::xam::session {
 
 namespace {
+
+// 1 from the game's XSessionEnd until its next XSessionCreate or XSessionStart:
+// the gameplay session is being torn down (rex_session_ending). Read only by
+// callers of that export.
+std::atomic<int> g_session_ending{0};
 
 constexpr X_HRESULT X_ONLINE_E_SESSION_NOT_FOUND = static_cast<X_HRESULT>(0x80155200L);
 constexpr X_HRESULT X_ONLINE_E_SESSION_FULL = static_cast<X_HRESULT>(0x80155202L);
@@ -221,6 +227,7 @@ uint32_t ObjectForHandle(uint32_t handle) {
 }
 
 X_HRESULT Create(uint8_t* buffer) {
+  g_session_ending.store(0);
   auto* data = reinterpret_cast<XGI_SESSION_CREATE*>(buffer);
   std::lock_guard lock(mutex);
   Session& s = sessions[data->obj_ptr];
@@ -354,6 +361,7 @@ X_HRESULT Start(uint8_t* buffer) {
     return X_ONLINE_E_SESSION_WRONG_STATE;
   }
   s->state = SessionState::kInGame;
+  g_session_ending.store(0);
   REXKRNL_INFO("XSessionStart obj={:08X}", uint32_t(data->obj_ptr));
   return X_E_SUCCESS;
 }
@@ -367,6 +375,7 @@ X_HRESULT End(uint8_t* buffer) {
   }
   s->state = SessionState::kLobby;
   REXKRNL_INFO("XSessionEnd obj={:08X}", uint32_t(data->obj_ptr));
+  g_session_ending.store(1);
   return X_E_SUCCESS;
 }
 
@@ -483,3 +492,7 @@ uint32_t JoinedHostIp() {
 }
 
 }  // namespace rex::kernel::xam::session
+
+// 1 while the game's gameplay session is ending (from XSessionEnd until the next
+// XSessionCreate or XSessionStart), else 0. Any thread.
+extern "C" int rex_session_ending() { return rex::kernel::xam::session::g_session_ending.load(); }
