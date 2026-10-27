@@ -66,6 +66,12 @@ REXCVAR_DEFINE_BOOL(log_file_async, true, "Log",
                     "explicit flushes still reach the file before the call returns.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+#if defined(_MSVC_STL_VERSION)
+// std::thread::native_handle() is the thread's HANDLE in the MSVC STL.
+extern "C" __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* handle,
+                                                                             unsigned long ms);
+#endif
+
 namespace rex {
 
 namespace {
@@ -88,6 +94,16 @@ class AsyncFileSink final : public spdlog::sinks::base_sink<std::mutex> {
   }
 
   ~AsyncFileSink() override {
+#if defined(_MSVC_STL_VERSION)
+    // exit() kills the other threads before DLL static destructors run. If
+    // the writer died holding mutex_, io_mutex_ or the FILE lock, waiting on
+    // them would hang the exit, so leave the file to the OS. Error lines
+    // were already written synchronously.
+    if (WaitForSingleObject(writer_.native_handle(), 0) == 0 /* WAIT_OBJECT_0 */) {
+      writer_.detach();
+      return;
+    }
+#endif
     {
       std::lock_guard lock(mutex_);
       stop_ = true;
